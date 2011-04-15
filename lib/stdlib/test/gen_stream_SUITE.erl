@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2010. All Rights Reserved.
+%% Copyright Ericsson AB 2010-2011. All Rights Reserved.
 %%
 %% The contents of this file are subject to the Erlang Public License,
 %% Version 1.1, (the "License"); you may not use this file except in
@@ -18,13 +18,15 @@
 %%
 -module(gen_stream_SUITE).
 
--include("test_server.hrl").
+-include_lib("test_server/include/test_server.hrl").
 -include_lib("kernel/include/file.hrl").
 -include_lib("kernel/include/inet.hrl").
 
--export([init_per_testcase/2, fin_per_testcase/2]).
+-export([init_per_testcase/2, end_per_testcase/2]).
 
--export([all/1]).
+-export([all/0, suite/0, groups/0,
+	 init_per_suite/1, end_per_suite/1,
+	 init_per_group/2, end_per_group/2]).
 -export([
 	 start_bin/1, start_link_bin/1, bad_calls/1,
 	 stream_info_bin/1, stream_info_file/1, stream_info_module/1,
@@ -44,7 +46,10 @@
 -define(datadir, "./gen_stream_SUITE_data").
 -define(datadir(Conf), ?config(data_dir, Conf)).
 
-all(suite) ->
+suite() ->
+    [{ct_hooks, [ts_install_cth]}].
+
+all() ->
     [start_bin, start_link_bin, bad_calls,
      stream_info_bin, stream_info_file, stream_info_module,
      num_procs_bin, num_procs_file, num_procs_module,
@@ -55,13 +60,27 @@ all(suite) ->
      circular_mult_module, circular_non_mult_module, circular_replicated_module
     ].
 
+groups() ->
+    [].
+
+init_per_suite(Config) ->
+    Config.
+
+end_per_suite(_Config) ->
+    ok.
+
+init_per_group(_GroupName, Config) ->
+    Config.
+
+end_per_group(_GroupName, Config) ->
+    Config.
 
 -define(default_timeout, ?t:minutes(1)).
 
 init_per_testcase(_Case, Config) ->
     ?line Dog = ?t:timetrap(?default_timeout),
     [{watchdog, Dog} | Config].
-fin_per_testcase(_Case, Config) ->
+end_per_testcase(_Case, Config) ->
     Dog = ?config(watchdog, Config),
     test_server:timetrap_cancel(Dog),
     ok.
