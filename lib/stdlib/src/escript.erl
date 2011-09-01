@@ -22,7 +22,7 @@
 -export([script_name/0, create/2, extract/2]).
 
 %% Internal API.
--export([start/0, start/1]).
+-export([start/0, start/1, parse_file/2]).
 
 %%-----------------------------------------------------------------------
 
@@ -346,7 +346,8 @@ parse_and_run(File, Args, Options) ->
             case Source of
                 archive ->
 		    {ok, FileInfo} = file:read_file_info(File),
-                    case code:set_primary_archive(File, FormsOrBin, FileInfo) of
+                    case code:set_primary_archive(File, FormsOrBin, FileInfo,
+						  {escript, parse_file, 2}) of
                         ok when CheckOnly ->
 			    case code:load_file(Module) of
 				{module, _} ->
