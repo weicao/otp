@@ -356,7 +356,37 @@ beam_script(Config) when is_list(Config) ->
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% Create an archive file containing two entire applications plus two
 %% alternate main modules. Generate a new escript containing the archive
-%% (with .app and .beam files and ) and the escript header.
+%% (with .app and .beam files and) and the escript header.
+
+%% mtime related caching bug with escript/primary archive files
+bad_central_directory(File) ->
+    %% Get header size. archive_script_main_with_shebang has a 2 line header.
+    ?line {ok, Fd} = file:open(File, [read]),
+    ?line true = eof =/= io:get_line(Fd, ''), %% get 1st line
+    ?line true = eof =/= io:get_line(Fd, ''), %% get 2nd line
+    ?line {ok, HeaderSz} = file:position(Fd, cur),
+    ?line ok = file:close(Fd),
+
+    ?line {ok, <<_Header:HeaderSz/binary, ArchiveBin/binary>>} =
+	file:read_file(File),
+    ?line {ok, FileInfo} = file:read_file_info(File),
+
+    %% Load archive
+    Module = archive_script_main2,
+    ?line ok = code:set_primary_archive(File, ArchiveBin, FileInfo,
+				       {escript, parse_file, 2}),
+    ?line {module, Module} = code:load_file(Module),
+    ?line true = erlang:function_exported(Module, main, 1),
+
+    %% Modify mtime of archive file and try to reload module
+    FileInfo1 = FileInfo#file_info{mtime=calendar:now_to_local_time(now())},
+    ?line ok = file:write_file_info(File, FileInfo1),
+    ?line {file, _} = code:is_loaded(Module),
+    ?line true = code:delete(Module),
+    ?line false = code:is_loaded(Module),
+    ?line {module, Module} = code:ensure_loaded(Module),
+
+    ok.
 
 archive_script(Config) when is_list(Config) ->
     %% Copy the orig files to priv_dir
@@ -461,6 +491,9 @@ archive_script(Config) when is_list(Config) ->
 		"dummy:[{archive_script_dummy,[\"bar\"]}]\n"
 		"priv:{ok,<<\"Some private data...\\n\">>}\n"
 		"ExitCode:0">>]),
+
+    %% use "archive_script_main_with_shebang" to verify that caching bug is fixed
+    ?line ok = bad_central_directory(MainScript ++ "_with_shebang"),
 
     ok.
 
