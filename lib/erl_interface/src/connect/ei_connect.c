@@ -69,6 +69,7 @@
 #endif
 
 #include <sys/socket.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h> 
 #include <arpa/inet.h>
@@ -1027,35 +1028,27 @@ int ei_rpc_to(ei_cnode *ec, int fd, char *mod, char *fun,
 int ei_rpc_from(ei_cnode *ec, int fd, int timeout, erlang_msg *msg,
 		ei_x_buff *x) 
 {
-    fd_set readmask;
-    struct timeval tv;
-    struct timeval *t = NULL;
+    struct pollfd set;
+    int r;
+
+    set.fd = fd;
+    set.events = POLLIN;
     
-    if (timeout >= 0) {
-	tv.tv_sec = timeout / 1000;
-	tv.tv_usec = (timeout % 1000) * 1000;
-	t = &tv;
-    }
+    r = poll(&set, 1, timeout);
     
-    FD_ZERO(&readmask);
-    FD_SET(fd,&readmask);
-    
-    switch (select(fd+1, &readmask, NULL, NULL, t)) {
-    case -1: 
-	erl_errno = EIO;
-	return ERL_ERROR;
-	
-    case 0:
-	erl_errno = ETIMEDOUT;
-	return ERL_TIMEOUT;
-	
-    default:
-	if (FD_ISSET(fd, &readmask)) {
-	    return ei_xreceive_msg(fd, msg, x);
-	} else {
-	    erl_errno = EIO;
-	    return ERL_ERROR;
-	}
+    if( r < 0 ) {
+        erl_errno = EIO;
+        return ERL_ERROR;
+    } else if( r == 0 ) {
+        erl_errno = ETIMEDOUT;
+        return ERL_TIMEOUT;
+    } else {
+        if ((set.revents & POLLIN) == POLLIN) {
+            return ei_xreceive_msg(fd, msg, x);
+        } else {
+            erl_errno = EIO;
+            return ERL_ERROR;
+        }
     }
 } /* rpc_from */
 

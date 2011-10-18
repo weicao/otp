@@ -69,6 +69,7 @@ static unsigned long param_one = 1;
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include <poll.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -110,23 +111,21 @@ static int ei_writev_t(int fd,  struct  iovec  *iov,  int iovcnt, unsigned ms)
 {
     int res;
     if (ms != 0) {
-	fd_set writemask;
-	struct timeval tv;
-	tv.tv_sec = (time_t) (ms / 1000U);
-	ms %= 1000U;
-	tv.tv_usec = (time_t) (ms * 1000U);
-	FD_ZERO(&writemask);
-	FD_SET(fd,&writemask);
-	switch (select(fd+1, NULL, &writemask, NULL, &tv)) {
-	case -1 : 
-	    return -1; /* i/o error */
-	case 0:
-	    return -2; /* timeout */
-	default:
-	    if (!FD_ISSET(fd, &writemask)) {
-		return -1; /* Other error */
-	    }
-	}
+        struct pollfd set;
+
+        set.fd = fd;
+        set.events = POLLOUT;
+
+        res = poll(&set, 1, ms);
+        if( res < 0 ) {
+            return -1; /* i/o error */
+        } else if ( res == 0 ) {
+            return -2; /* timeout */
+        } else {
+            if ((set.revents & POLLOUT) != POLLOUT) {
+                return -1; /* Other error */
+            }
+        }
     }
     res = writev(fd, iov, iovcnt);
     return (res < 0) ? -1 : res;
@@ -224,26 +223,23 @@ int ei_connect_t(int fd, void *sinp, int sin_siz, unsigned ms)
 		error != ERROR_INPROGRESS) {
 		return -1;
 	    } else {
-		tv.tv_sec = (long) (ms/1000U);
-		ms %= 1000U;
-		tv.tv_usec = (long) (ms * 1000U);
-		FD_ZERO(&writefds);
-		FD_SET(fd,&writefds);
-		FD_ZERO(&exceptfds);
-		FD_SET(fd,&exceptfds);
-		s_res = select(fd + 1, NULL, &writefds, &exceptfds, &tv);
-		switch (s_res) {
-		case 0:
-		    return -2;
-		case 1:
-		    if (FD_ISSET(fd, &exceptfds)) {
-			return  -1;
-		    } else {
-			return 0; /* Connect completed */
-		    }
-		default:
-		    return -1;
-		}
+	    struct pollfd set;
+
+	    set.fd = fd;
+	    set.events = POLLOUT|POLLERR;
+
+	    res = poll(&set, 1, ms);
+	    if( res < 0 ) {
+            return -1; /* i/o error */
+	    } else if ( res == 0 ) {
+            return -2; /* timeout */
+	    } else {
+            if ((set.revents & POLLOUT) == POLLOUT) {
+	    	    return 0;
+            } else {
+                return -1;
+            }
+	    }
 	    }
 	} 
     }
@@ -253,51 +249,45 @@ int ei_accept_t(int fd, void  *addr,   void  *addrlen, unsigned ms)
 {
     int res;
     if (ms != 0) {
-	fd_set readmask;
-	struct timeval tv;
-	tv.tv_sec = (time_t) (ms / 1000U);
-	ms %= 1000U;
-	tv.tv_usec = (time_t) (ms * 1000U);
-	FD_ZERO(&readmask);
-	FD_SET(fd,&readmask);
-	switch (select(fd+1, &readmask, NULL, NULL, &tv)) {
-	case -1 : 
-	    return -1; /* i/o error */
-	case 0:
-	    return -2; /* timeout */
-	default:
-	    if (!FD_ISSET(fd, &readmask)) {
-		return -1; /* Other error */
-	    }
-	}
+        struct pollfd set;
+
+        set.fd = fd;
+        set.events = POLLIN;
+        
+        res = poll(&set, 1, ms);
+        if( res < 0 ) {
+            return -1; /* i/o error */
+        } else if ( res == 0 ) {
+            return -2; /* timeout */
+        } else {
+            if ((set.revents & POLLIN) != POLLIN) {
+                return -1; /* Other error */
+            }
+        }
     }
     res = (int) accept(fd,addr,addrlen);
     return (res < 0) ? -1 : res;
 }
-    
-
 
 static int ei_read_t(int fd, char* buf, int len, unsigned  ms)
 {
     int res;
     if (ms != 0) {
-	fd_set readmask;
-	struct timeval tv;
-	tv.tv_sec = (time_t) (ms / 1000U);
-	ms %= 1000U;
-	tv.tv_usec = (time_t) (ms * 1000U);
-	FD_ZERO(&readmask);
-	FD_SET(fd,&readmask);
-	switch (select(fd+1, &readmask, NULL, NULL, &tv)) {
-	case -1 : 
-	    return -1; /* i/o error */
-	case 0:
-	    return -2; /* timeout */
-	default:
-	    if (!FD_ISSET(fd, &readmask)) {
-		return -1; /* Other error */
-	    }
-	}
+        struct pollfd set;
+
+        set.fd = fd;
+        set.events = POLLIN;
+        
+        res = poll(&set, 1, ms);
+        if( res < 0 ) {
+            return -1; /* i/o error */
+        } else if ( res == 0 ) {
+            return -2; /* timeout */
+        } else {
+            if ((set.revents & POLLIN) != POLLIN) {
+                return -1; /* Other error */
+            }
+        }
     }
     res = readsocket(fd, buf, len);
     return (res < 0) ? -1 : res;
@@ -307,23 +297,21 @@ static int ei_write_t(int fd, const char* buf, int len, unsigned  ms)
 {
     int res;
     if (ms != 0) {
-	fd_set writemask;
-	struct timeval tv;
-	tv.tv_sec = (time_t) (ms / 1000U);
-	ms %= 1000U;
-	tv.tv_usec = (time_t) (ms * 1000U);
-	FD_ZERO(&writemask);
-	FD_SET(fd,&writemask);
-	switch (select(fd+1, NULL, &writemask, NULL, &tv)) {
-	case -1 : 
-	    return -1; /* i/o error */
-	case 0:
-	    return -2; /* timeout */
-	default:
-	    if (!FD_ISSET(fd, &writemask)) {
-		return -1; /* Other error */
-	    }
-	}
+        struct pollfd set;
+
+        set.fd = fd;
+        set.events = POLLOUT;
+
+        res = poll(&set, 1, ms);
+        if( res < 0 ) {
+            return -1; /* i/o error */
+        } else if ( res == 0 ) {
+            return -2; /* timeout */
+        } else {
+            if ((set.revents & POLLOUT) != POLLOUT) {
+                return -1; /* Other error */
+            }
+        }
     }
     res =  writesocket(fd, buf, len);
     return (res < 0) ? -1 : res;
