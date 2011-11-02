@@ -86,9 +86,9 @@ analyze_exit_term(Term) ->
 
 is_stacktrace([]) ->
     true;
-is_stacktrace([{M,F,A,[{file,File},{line,Line}]}|Fs]) when is_atom(M), is_atom(F), is_integer(A), is_list(File), is_integer(Line) ->
+is_stacktrace([{M,F,A,Fl}|Fs]) when is_atom(M), is_atom(F), is_integer(A), is_list(Fl) ->
     is_stacktrace(Fs);
-is_stacktrace([{M,F,As,[{file,File},{line,Line}]}|Fs]) when is_atom(M), is_atom(F), is_list(As), is_list(File), is_integer(Line) ->
+is_stacktrace([{M,F,As,Fl}|Fs]) when is_atom(M), is_atom(F), is_list(As), is_list(Fl) ->
     is_stacktrace(Fs);
 is_stacktrace(_) ->
     false.
@@ -97,10 +97,15 @@ format_stacktrace(Trace) ->
     format_stacktrace(Trace, "in function", "in call from").
 
 
-format_stacktrace([{M,F,A,[{file, File},{line, Line}]}|Fs], Pre, Pre1) when is_integer(A) ->
-    [io_lib:fwrite("  ~s ~w:~w/~w [~s:~w]\n", [Pre, M, F, A, File, Line])
+format_stacktrace([{M,F,A,Fl}|Fs], Pre, Pre1) when is_integer(A) ->
+    S = case Fl of 
+        [{file, File},{line, Line}]->
+            io_lib:fwrite(" [~s:~w]", [File, Line]);
+        _-> ""
+        end,
+    [io_lib:fwrite("  ~s ~w:~w/~w~s\n", [Pre, M, F, A, S])
      | format_stacktrace(Fs, Pre1, Pre1)];
-format_stacktrace([{M,F,As,[{file, File},{line, Line}]}|Fs], Pre, Pre1) when is_list(As) ->
+format_stacktrace([{M,F,As,Fl}|Fs], Pre, Pre1) when is_list(As) ->
     A = length(As),
     C = case is_op(M,F,A) of
 	    true when A =:= 1 ->
@@ -113,8 +118,13 @@ format_stacktrace([{M,F,As,[{file, File},{line, Line}]}|Fs], Pre, Pre1) when is_
 	    false ->
 		io_lib:fwrite("~w(~s)", [F,format_arglist(As)])
 	end,
-    [io_lib:fwrite("  ~s ~w:~w/~w [~s:~w]\n    called as ~s\n",
-		   [Pre,M,F,A,File,Line,C])
+    S = case Fl of 
+        [{file, File},{line, Line}]->
+            io_lib:fwrite(" [~s:~w]", [File, Line]);
+        _-> ""
+        end,
+    [io_lib:fwrite("  ~s ~w:~w/~w~s\n    called as ~s\n",
+		   [Pre,M,F,A,S,C])
      | format_stacktrace(Fs,Pre1,Pre1)];
 format_stacktrace([],_Pre,_Pre1) ->
     "".
