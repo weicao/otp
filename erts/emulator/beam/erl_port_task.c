@@ -199,6 +199,36 @@ pop_port(ErtsRunQueue *runq)
     return pp;
 }
 
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+int erts_transfer_outstanding_io_tasks(Port* pp, ErtsRunQueue* from, ErtsRunQueue* to)
+{
+    ERTS_SMP_LC_ASSERT(erts_smp_lc_runq_is_locked(from));
+    if(pp) {
+        ErtsPortTaskQueue *ptqp = pp->sched.taskq;
+        if (ptqp) {
+        ErtsPortTask *ptp = ptqp->first;
+        int io_tasks = 0;
+        while (ptp) {
+            switch (ptp->type) {
+            case ERTS_PORT_TASK_INPUT:
+            case ERTS_PORT_TASK_OUTPUT:
+            case ERTS_PORT_TASK_EVENT:
+                io_tasks ++;
+                break;
+            default:
+                break;
+            }
+            ptp = ptp->next;
+        }
+        if(io_tasks) {
+            ASSERT(erts_smp_atomic_read_nob(&from->ports.outstanding_io_tasks) >= io_tasks);
+            erts_smp_atomic_add_relb(&from->ports.outstanding_io_tasks, -1*io_tasks);
+            erts_smp_atomic_add_relb(&to->ports.outstanding_io_tasks, io_tasks);
+        }
+        }
+    }
+}
+#endif
 
 #ifdef HARD_DEBUG
 
@@ -457,6 +487,10 @@ erts_port_task_abort(Eterm id, ErtsPortTaskHandle *pthp)
     case ERTS_PORT_TASK_EVENT:
 	ASSERT(erts_smp_atomic_read_nob(&erts_port_task_outstanding_io_tasks) > 0);
 	erts_smp_atomic_dec_relb(&erts_port_task_outstanding_io_tasks);
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+	ASSERT(erts_smp_atomic_read_nob(&runq->ports.outstanding_io_tasks) > 0);
+	erts_smp_atomic_dec_relb(&runq->ports.outstanding_io_tasks);
+#endif
 	break;
     default:
 	break;
@@ -489,7 +523,8 @@ erts_port_task_schedule(Eterm id,
 			ErtsPortTaskHandle *pthp,
 			ErtsPortTaskType type,
 			ErlDrvEvent event,
-			ErlDrvEventData event_data)
+			ErlDrvEventData event_data,
+			int ix)
 {
     ErtsRunQueue *runq;
     Port *pp;
@@ -519,6 +554,14 @@ erts_port_task_schedule(Eterm id,
 	    erts_smp_runq_unlock(runq);
 	return -1;
     }
+    
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+    /* port has been migrated to another pollset */
+    if (ix >=0 && runq->ix != ix) {
+        erts_smp_runq_unlock(runq);
+        return 0;
+    }
+#endif
 
     ASSERT(!erts_port_task_is_scheduled(pthp));
 
@@ -530,17 +573,22 @@ erts_port_task_schedule(Eterm id,
     }
 
 #ifdef ERTS_SMP
-    if (enq_port) {
-	ErtsRunQueue *xrunq = erts_check_emigration_need(runq, ERTS_PORT_PRIO_LEVEL);
-	if (xrunq) {
-	    /* Port emigrated ... */
-	    erts_smp_atomic_set_nob(&pp->run_queue, (erts_aint_t) xrunq);
-	    erts_smp_runq_unlock(runq);
-	    runq = erts_port_runq(pp);
-	    if (!runq)
-		return -1;
-	}
-    }
+//    if (enq_port) {
+//	ErtsRunQueue *xrunq = erts_check_emigration_need(runq, ERTS_PORT_PRIO_LEVEL);
+//	if (xrunq) {
+//	    /* Port emigrated ... */
+//	    erts_smp_atomic_set_nob(&pp->run_queue, (erts_aint_t) xrunq);
+//	    erts_smp_runq_unlock(runq);
+//	    
+//#ifdef ERTS_POLLSET_PER_SCHEDULER
+//        erts_change_port_pollset(pp->id, xrunq->ix);
+//#endif
+//	    
+//	    runq = erts_port_runq(pp);
+//	    if (!runq)
+//		return -1;
+//	}
+//    }
 #endif
 
     ASSERT(pp->sched.taskq);
@@ -561,6 +609,9 @@ erts_port_task_schedule(Eterm id,
     case ERTS_PORT_TASK_OUTPUT:
     case ERTS_PORT_TASK_EVENT:
 	erts_smp_atomic_inc_relb(&erts_port_task_outstanding_io_tasks);
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+	erts_smp_atomic_inc_relb(&runq->ports.outstanding_io_tasks);
+#endif
 	/* Fall through... */
     default:
 	enqueue_task(pp->sched.taskq, ptp);
@@ -703,7 +754,12 @@ erts_port_task_execute(ErtsRunQueue *runq, Port **curr_port_pp)
     if (!pp->sched.taskq) {
 	if (erts_system_profile_flags.runnable_ports)
 	    profile_runnable_port(pp, am_inactive);
-	res = (erts_smp_atomic_read_nob(&erts_port_task_outstanding_io_tasks)
+	res = 
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+	(erts_smp_atomic_read_nob(&runq->ports.outstanding_io_tasks)
+#else
+	(erts_smp_atomic_read_nob(&erts_port_task_outstanding_io_tasks)
+#endif
 	       != (erts_aint_t) 0);
 	goto done;
     }
@@ -851,6 +907,10 @@ erts_port_task_execute(ErtsRunQueue *runq, Port **curr_port_pp)
 	       >= io_tasks_executed);
 	erts_smp_atomic_add_relb(&erts_port_task_outstanding_io_tasks,
 				 -1*io_tasks_executed);
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+	ASSERT(erts_smp_atomic_read_nob(&runq->ports.outstanding_io_tasks) >= io_tasks_executed);
+	erts_smp_atomic_add_relb(&runq->ports.outstanding_io_tasks, -1*io_tasks_executed);
+#endif
     }
 
     *curr_port_pp = NULL;
@@ -885,8 +945,15 @@ erts_port_task_execute(ErtsRunQueue *runq, Port **curr_port_pp)
 	}
 	else {
 	    /* Port emigrated ... */
+#ifdef ERTS_POLLSET_PER_SCHEDULER
+	    erts_transfer_outstanding_io_tasks(pp, runq, xrunq);
+#endif
 	    erts_smp_atomic_set_nob(&pp->run_queue, (erts_aint_t) xrunq);
 	    erts_smp_runq_unlock(runq);
+
+#ifdef ERTS_POLLSET_PER_SCHEDULER
+        erts_change_port_pollset(pp->id, xrunq->ix);
+#endif
 
 	    xrunq = erts_port_runq(pp);
 	    if (xrunq) {
@@ -894,6 +961,7 @@ erts_port_task_execute(ErtsRunQueue *runq, Port **curr_port_pp)
 		ASSERT(pp->sched.exe_taskq);
 		pp->sched.exe_taskq = NULL;
 		erts_smp_runq_unlock(xrunq);
+
 		erts_smp_notify_inc_runq(xrunq);
 	    }
 
@@ -902,7 +970,12 @@ erts_port_task_execute(ErtsRunQueue *runq, Port **curr_port_pp)
 #endif
     }
 
-    res = (erts_smp_atomic_read_nob(&erts_port_task_outstanding_io_tasks)
+    res = 
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+	(erts_smp_atomic_read_nob(&runq->ports.outstanding_io_tasks)
+#else
+    (erts_smp_atomic_read_nob(&erts_port_task_outstanding_io_tasks)
+#endif
 	   != (erts_aint_t) 0);
 
     ERTS_PT_CHK_PRES_PORTQ(runq, pp);
@@ -925,7 +998,12 @@ erts_port_task_execute(ErtsRunQueue *runq, Port **curr_port_pp)
 	    erts_smp_runq_unlock(runq);
 	    erts_port_cleanup(pp); /* Might aquire runq lock */
 	    erts_smp_runq_lock(runq);
-	    res = (erts_smp_atomic_read_nob(&erts_port_task_outstanding_io_tasks)
+	    res = 
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+        (erts_smp_atomic_read_nob(&runq->ports.outstanding_io_tasks)
+#else
+	    (erts_smp_atomic_read_nob(&erts_port_task_outstanding_io_tasks)
+#endif
 		   != (erts_aint_t) 0);
 	}
     }
@@ -1004,6 +1082,7 @@ erts_port_is_scheduled(Port *pp)
     return res;
 }
 
+
 #ifdef ERTS_SMP
 void
 erts_enqueue_port(ErtsRunQueue *rq, Port *pp)
@@ -1023,6 +1102,7 @@ erts_dequeue_port(ErtsRunQueue *rq)
     ASSERT(!pp
 	   || rq == (ErtsRunQueue *) erts_smp_atomic_read_nob(&pp->run_queue));
     ASSERT(!pp || pp->sched.in_runq);
+    
     return pp;
 }
 

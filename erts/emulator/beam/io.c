@@ -2833,7 +2833,7 @@ static void schedule_port_timeout(Port *p)
 				   &p->timeout_task,
 				   ERTS_PORT_TASK_TIMEOUT,
 				   (ErlDrvEvent) -1,
-				   NULL);
+				   NULL, -1);
 }
 
 ErlDrvTermData driver_mk_term_nil(void)

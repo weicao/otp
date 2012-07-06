@@ -661,7 +661,9 @@ extern char *erts_sys_ddll_error(int code);
  */
 #include "erl_time.h"
 
+void erts_sys_schedule_interrupt_rq(int ix, int set);
 void erts_sys_schedule_interrupt(int set);
+
 #ifdef ERTS_SMP
 void erts_sys_schedule_interrupt_timed(int set, erts_short_time_t msec);
 void erts_sys_main_thread(void);
@@ -671,7 +673,7 @@ extern void erts_sys_prepare_crash_dump(void);
 extern void erts_sys_pre_init(void);
 extern void erl_sys_init(void);
 extern void erl_sys_args(int *argc, char **argv);
-extern void erl_sys_schedule(int);
+extern void erl_sys_schedule(int, int);
 void sys_tty_reset(int);
 
 int sys_max_files(void);

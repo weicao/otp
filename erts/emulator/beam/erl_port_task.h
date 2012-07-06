@@ -120,9 +120,14 @@ int erts_port_task_schedule(Eterm,
 			    ErtsPortTaskHandle *,
 			    ErtsPortTaskType,
 			    ErlDrvEvent,
-			    ErlDrvEventData);
+			    ErlDrvEventData,
+			    int);
 void erts_port_task_free_port(Port *);
 int erts_port_is_scheduled(Port *);
+
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+int erts_transfer_outstanding_io_tasks(Port* pp, ErtsRunQueue* from, ErtsRunQueue* to);
+#endif
 
 #ifdef ERTS_SMP
 void erts_enqueue_port(ErtsRunQueue *rq, Port *pp);

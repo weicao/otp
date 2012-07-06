@@ -239,6 +239,12 @@ erl_sys_args(int* argc, char** argv)
 }
 
 void
+erts_sys_schedule_interrupt_rq(int ix, int set)
+{
+    erts_check_io_interrupt_rq(ix, set);
+}
+
+void
 erts_sys_schedule_interrupt(int set)
 {
     erts_check_io_interrupt(set);
@@ -250,9 +256,9 @@ erts_sys_schedule_interrupt(int set)
  * steps. runnable == 0 iff there are no runnable Erlang processes.
  */
 void
-erl_sys_schedule(int runnable)
+erl_sys_schedule(int ix, int runnable)
 {	
-    erts_check_io(!runnable);
+    erts_check_io(ix, !runnable);
 }
 
 void erts_do_break_handling(void)

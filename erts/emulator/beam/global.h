@@ -187,6 +187,9 @@ struct port {
     ErtsPrtSD *psd;		 /* Port specific data */
 };
 
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+int erts_change_port_pollset(Eterm, int);
+#endif
 
 ERTS_GLB_INLINE ErtsRunQueue *erts_port_runq(Port *prt);
 

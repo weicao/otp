@@ -78,16 +78,25 @@ typedef char EventStateFlags;
 #define ERTS_CIO_POLL_INIT	ERTS_POLL_EXPORT(erts_poll_init)
 #define ERTS_CIO_POLL_INFO	ERTS_POLL_EXPORT(erts_poll_info)
 
-static struct pollset_info
+struct pollset_info
 {
     ErtsPollSet ps;
     erts_smp_atomic_t in_poll_wait;        /* set while doing poll */
+};
+
+static struct pollset_info *erts_pollsets;
+static Uint erts_no_pollsets;
+
+#define ERTS_POLLSET_IX(IX)                 \
+  (ASSERT_EXPR(0 <= (IX) && (IX) < erts_no_pollsets),			\
+   &erts_pollsets[(IX)])
+
+struct deselected_info {
 #ifdef ERTS_SMP
     struct removed_fd* removed_list;       /* list of deselected fd's*/
     erts_smp_spinlock_t removed_list_lock;
 #endif
-}pollset;
-#define NUM_OF_POLLSETS 1
+} deselected;
 
 typedef struct {
 #ifndef ERTS_SYS_CONTINOUS_FD_NUMBERS
@@ -118,6 +127,23 @@ struct removed_fd {
 #endif
 
 };
+#endif
+
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+struct selected_fd {
+    struct selected_fd *next;
+#ifdef ERTS_SYS_CONTINOUS_FD_NUMBERS
+    ErtsSysFdType fd;
+#else
+    ErtsDrvEventState *state;
+#endif
+};
+
+struct selected_fd_list {       /* list of selected fd in each port */
+    struct selected_fd *head;
+    erts_smp_mtx_t lock;
+};
+
 #endif
 
 #ifdef ERTS_SYS_CONTINOUS_FD_NUMBERS
@@ -212,17 +238,251 @@ drvport2id(ErlDrvPort dp)
     }
 }
 
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+static struct selected_fd_list *sfl_tab;
+static erts_smp_mtx_t sfl_tab_lock;
+ERTS_SCHED_PREF_QUICK_ALLOC_IMPL(selected_fd, struct selected_fd, 64, ERTS_ALC_T_UNDEF)
+
+static void init_sfl_tab(void)
+{
+    erts_smp_mtx_lock(&sfl_tab_lock);
+    if (sfl_tab == NULL) {
+        int i;
+        sfl_tab = (struct selected_fd_list *) erts_alloc(ERTS_ALC_T_UNDEF,
+            erts_max_ports * sizeof(struct selected_fd_list));
+        for (i = 0; i < erts_max_ports; i++) {
+            sfl_tab[i].head = NULL;
+            erts_smp_mtx_init(&sfl_tab[i].lock,
+			   "sfl_lock");
+        }
+    }
+    erts_smp_mtx_unlock(&sfl_tab_lock);
+}
+
+static void add_selected_fd(ErlDrvPort drvport, ErtsDrvEventState* state)
+{
+    int ix = (int) drvport;
+    struct selected_fd *sflp;
+    struct selected_fd **insp;
+    
+    ASSERT(ix >= 0 && ix < erts_max_ports);
+    if(sfl_tab == NULL) init_sfl_tab();
+
+    erts_smp_mtx_lock(&sfl_tab[ix].lock);
+    sflp = sfl_tab[ix].head;
+    insp = &sfl_tab[ix].head;
+    while (sflp) {
+#ifdef ERTS_SYS_CONTINOUS_FD_NUMBERS
+        if (sflp->fd == state->fd)
+            break;
+#else
+        if (sflp->state == state)
+            break;
+#endif
+        insp = &sflp->next;
+        sflp = sflp->next;
+    }
+    
+    if(!sflp) {
+        struct selected_fd *p = selected_fd_alloc();
+#ifdef ERTS_SYS_CONTINOUS_FD_NUMBERS
+        p->fd = state->fd;
+#else
+        p->state = state;
+#endif
+        p->next = NULL;
+        *insp = p;
+    }
+    erts_smp_mtx_unlock(&sfl_tab[ix].lock);
+}
+
+static void del_selected_fd(ErlDrvPort drvport, ErtsDrvEventState* state)
+{
+    int ix = (int) drvport;
+    struct selected_fd *sflp;
+    struct selected_fd **delp;
+    
+    ASSERT(ix >= 0 && ix < erts_max_ports);
+    if(sfl_tab == NULL)
+        return;
+    
+    erts_smp_mtx_lock(&sfl_tab[ix].lock);
+    sflp = sfl_tab[ix].head;
+    delp = &sfl_tab[ix].head;
+    while (sflp) {
+#ifdef ERTS_SYS_CONTINOUS_FD_NUMBERS
+        if (sflp->fd == state->fd)
+            break;
+#else
+        if (sflp->state == state)
+            break;
+#endif
+        delp = &sflp->next;
+        sflp = sflp->next;
+    }
+    
+    if (sflp) {
+        *delp = sflp->next;
+        selected_fd_free(sflp);
+    }
+    erts_smp_mtx_unlock(&sfl_tab[ix].lock);
+}
+    
+static struct selected_fd* deepcopy_sfl(struct selected_fd *sflp)
+{
+    struct selected_fd *copy, **insp;
+    insp = &copy;
+    /* deep copy */
+    while(sflp) {
+        struct selected_fd *sf = selected_fd_alloc();
+#ifdef ERTS_SYS_CONTINOUS_FD_NUMBERS
+        sf->fd = sflp->fd;
+#else
+        sf->state = sflp->state;
+#endif
+        *insp = sf;
+        insp = &sf->next;
+        sflp = sflp->next;
+    }
+    *insp = NULL;
+    return copy;
+}
+
+static void free_sfl(struct selected_fd *sflp)
+{
+    struct selected_fd *tofree;
+    while(sflp) {
+        tofree = sflp;
+        sflp = sflp->next;
+        selected_fd_free(tofree);
+    }
+}
+
+#define ERTS_PORT_TASK_INVALID_PORT(P, ID) \
+  ((erts_port_status_get((P)) & ERTS_PORT_SFLGS_DEAD) || (P)->id != (ID))
+
+int
+ERTS_CIO_EXPORT(erts_check_io_change_port_pollset)(Eterm id, int to_rq_ix)
+{
+    Port *pp;
+    int ix;
+    ErtsPollSet to_ps = ERTS_POLLSET_IX(to_rq_ix)->ps;
+    struct selected_fd *copy, *sflp;
+    int do_wake;
+    
+    if(sfl_tab == NULL) /* can safe migrate this port */
+        return 0;
+        
+    ASSERT(is_internal_port(id));
+    ix = internal_port_index(id);
+    pp = &erts_port[ix];
+    
+    erts_smp_mtx_lock(&sfl_tab[ix].lock);
+    copy = sflp = deepcopy_sfl(sfl_tab[ix].head);
+    erts_smp_mtx_unlock(&sfl_tab[ix].lock);
+    
+    if (!copy) return 0;
+
+    while(sflp) {
+        ErtsDrvEventState* state ;
+        ErtsSysFdType fd;
+        erts_smp_mtx_t* mtx;
+        ErtsRunQueue *runq;
+    
+#ifdef ERTS_SYS_CONTINOUS_FD_NUMBERS
+        fd = sflp->fd;
+        mtx = fd_mtx(fd);
+        erts_smp_mtx_lock(mtx);
+        state = &drv_ev_state[fd];
+#else
+        state = sflp->state;
+        fd = state->fd;
+        mtx = fd_mtx(fd);
+        erts_smp_mtx_lock(mtx);
+#endif
+
+        /* lock rq after lock fd_mutex to avoid deadlock */
+        runq = erts_port_runq(pp); 
+        
+        /* it's possible port had been migrated to another rq or closed */
+        if ( !runq || runq->ix != to_rq_ix || ERTS_PORT_TASK_INVALID_PORT(pp, id) ) {
+        if (runq) {
+            erts_smp_runq_unlock(runq);
+            erts_smp_mtx_unlock(mtx);
+        }
+        free_sfl(copy);
+        return -1;
+        }
+
+        switch (state->type) {
+        case ERTS_EV_TYPE_STOP_USE:
+        case ERTS_EV_TYPE_NONE:
+        break;
+        case ERTS_EV_TYPE_DRV_SEL: {
+        Eterm iid = state->driver.select->inport;
+        Eterm oid = state->driver.select->outport;
+        state->events = 0;
+        
+        if( id == iid ) {
+            ErtsPollSet from_ps = state->driver.select->inps;
+            if( from_ps != to_ps ) {
+            state->driver.select->inps = to_ps;
+            do_wake = 1;
+            ERTS_CIO_POLL_CTL(from_ps, state->fd, ERTS_POLL_EV_IN, 0, &do_wake);
+            do_wake = 1;
+            state->events |= ERTS_CIO_POLL_CTL(to_ps, state->fd, ERTS_POLL_EV_IN, 1, &do_wake);
+            }
+        }
+        
+        if( id == oid ) {
+            ErtsPollSet from_ps = state->driver.select->outps;
+            if( from_ps != to_ps ) {
+            state->driver.select->outps = to_ps;
+            do_wake = 1;
+            ERTS_CIO_POLL_CTL(from_ps, state->fd, ERTS_POLL_EV_OUT, 0, &do_wake);
+            do_wake = 1;
+            state->events |= ERTS_CIO_POLL_CTL(to_ps, state->fd, ERTS_POLL_EV_OUT, 1, &do_wake);
+            }
+        }
+        break;
+        }
+        case ERTS_EV_TYPE_DRV_EV: {
+        ErtsPollSet from_ps = state->driver.event->ps;
+        if (from_ps != to_ps) {
+        state->driver.event->ps = to_ps;
+        do_wake = 0;
+        ERTS_CIO_POLL_CTL(from_ps, state->fd, state->events, 0, &do_wake);
+        do_wake = 0;
+        state->events = ERTS_CIO_POLL_CTL(to_ps, state->fd, state->events, 1, &do_wake);
+        }
+        break;
+        }
+        default:
+        ASSERT(0);
+        }
+        erts_smp_runq_unlock(runq);
+        erts_smp_mtx_unlock(mtx);
+        
+        sflp = sflp->next;
+    }
+    
+    free_sfl(copy);
+    return 0;
+}
+
+#endif
+
 #ifdef ERTS_SMP
 ERTS_SCHED_PREF_QUICK_ALLOC_IMPL(removed_fd, struct removed_fd, 64, ERTS_ALC_T_FD_LIST)
 #endif
 
 static ERTS_INLINE void
-remember_removed(ErtsDrvEventState *state, struct pollset_info* psi)
+remember_removed(ErtsDrvEventState *state, struct deselected_info* psi)
 {
 #ifdef ERTS_SMP
     struct removed_fd *fdlp;
     ERTS_SMP_LC_ASSERT(erts_smp_lc_mtx_is_locked(fd_mtx(state->fd)));
-    if (erts_smp_atomic_read_nob(&psi->in_poll_wait)) {
+    //if (erts_smp_atomic_read_nob(&psi->in_poll_wait)) {
 	state->remove_cnt++;
 	ASSERT(state->remove_cnt > 0);
 	fdlp = removed_fd_alloc();
@@ -236,7 +496,7 @@ remember_removed(ErtsDrvEventState *state, struct pollset_info* psi)
 	fdlp->next = psi->removed_list;
 	psi->removed_list = fdlp;
 	erts_smp_spin_unlock(&psi->removed_list_lock);
-    }
+    //}
 #endif
 }
 
@@ -257,7 +517,7 @@ is_removed(ErtsDrvEventState *state)
 }
 
 static void
-forget_removed(struct pollset_info* psi)
+forget_removed(struct deselected_info* psi)
 {
 #ifdef ERTS_SMP
     struct removed_fd* fdlp;
@@ -425,12 +685,61 @@ static void
 deselect(ErtsDrvEventState *state, int mode)
 {
     int do_wake = 0;
-    ErtsPollEvents rm_events;
     ERTS_SMP_LC_ASSERT(erts_smp_lc_mtx_is_locked(fd_mtx(state->fd)));
     ASSERT(state->events);
 
     abort_tasks(state, mode);
 
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+    switch(state->type) {
+    case ERTS_EV_TYPE_DRV_SEL: {
+        Eterm iid = state->driver.select->inport;
+        Eterm oid = state->driver.select->outport;
+        state->events = 0;
+        if (!mode) {
+            mode = ERL_DRV_READ | ERL_DRV_WRITE;
+        }
+        if (mode & ERL_DRV_READ && is_not_nil(iid)) {
+            state->events |= ERTS_CIO_POLL_CTL(state->driver.select->inps,
+                    state->fd, ERTS_POLL_EV_IN, 0, &do_wake);
+            state->driver.select->inport = NIL;
+            state->driver.select->inps = NULL;
+            do_wake = 0;
+            
+            if( is_nil(oid) || iid != oid || !(mode & ERL_DRV_WRITE) ) {
+                del_selected_fd(internal_port_index(iid), state);
+            }
+        }
+        if (mode & ERL_DRV_WRITE && is_not_nil(oid)) {
+            state->events |= ERTS_CIO_POLL_CTL(state->driver.select->outps,
+                    state->fd, ERTS_POLL_EV_OUT, 0, &do_wake);
+            state->driver.select->outport = NIL;
+            state->driver.select->outps = NULL;
+            
+            if( is_nil(iid) || iid != oid || mode & ERL_DRV_READ)
+                del_selected_fd(internal_port_index(oid), state);
+        }
+        
+        break;
+    }
+#if ERTS_CIO_HAVE_DRV_EVENT
+	case ERTS_EV_TYPE_DRV_EV:
+        ASSERT(!mode);
+        state->events = ERTS_CIO_POLL_CTL(state->driver.event->ps,
+                state->fd, state->events, 0, &do_wake);
+        del_selected_fd(internal_port_index(state->driver.event->port), state);
+	    break;
+#endif
+	case ERTS_EV_TYPE_NONE:
+	    break;
+	default:
+	    ASSERT(0);
+	    break;
+    }
+
+#else
+    {
+    ErtsPollEvents rm_events;
     if (!mode)
 	rm_events = state->events;
     else {
@@ -446,7 +755,9 @@ deselect(ErtsDrvEventState *state, int mode)
 	}
     }
 
-    state->events = ERTS_CIO_POLL_CTL(pollset.ps, state->fd, rm_events, 0, &do_wake);
+    state->events = ERTS_CIO_POLL_CTL(ERTS_POLLSET_IX(0)->ps, state->fd, rm_events, 0, &do_wake);
+    }
+#endif
 
     if (!(state->events)) {
 	switch (state->type) {
@@ -473,7 +784,7 @@ deselect(ErtsDrvEventState *state, int mode)
 	state->driver.select = NULL;
 	state->type = ERTS_EV_TYPE_NONE;
 	state->flags = 0;
-	remember_removed(state, &pollset);
+	remember_removed(state, &deselected);
     }
 }
 
@@ -499,12 +810,19 @@ ERTS_CIO_EXPORT(driver_select)(ErlDrvPort ix,
     ErtsDrvEventState *state;
     int wake_poller;
     int ret;
+    ErtsPollSet inps;
+    ErtsPollSet outps;
+    
 #ifdef USE_VM_PROBES
     DTRACE_CHARBUF(name, 64);
 #endif
     
     ERTS_SMP_LC_ASSERT(erts_drvport2port(ix)
 		       && erts_lc_is_port_locked(erts_drvport2port(ix)));
+
+#if !defined(ERTS_SMP) || !defined(ERTS_POLLSET_PER_SCHEDULER)
+    inps = outps = ERTS_POLLSET_IX(0)->ps;
+#endif
 
 #ifdef ERTS_SYS_CONTINOUS_FD_NUMBERS
     if ((unsigned)fd >= (unsigned)erts_smp_atomic_read_nob(&drv_ev_state_len)) {
@@ -585,14 +903,45 @@ ERTS_CIO_EXPORT(driver_select)(ErlDrvPort ix,
 	   (state->type == ERTS_EV_TYPE_NONE && !state->events));
 
     if (!on && !(state->flags & ERTS_EV_FLAG_USED) 
-	&& state->events && !(state->events & ~ctl_events)) {	
+	&& state->events && !(state->events & ~ctl_events)) {
 	/* Old driver removing all events. At least wake poller.
 	   It will not make close() 100% safe but it will prevent
 	   actions delayed by poll timeout. */
 	wake_poller = 1;
     }
 
-    new_events = ERTS_CIO_POLL_CTL(pollset.ps, state->fd, ctl_events, on, &wake_poller);
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+    new_events = 0;
+    {
+    int wake_poller_cmd;
+    int wake_poller_res = 0;
+    if (ctl_events & ERTS_POLL_EV_IN) {
+        wake_poller_cmd = wake_poller;
+        if(state->type == ERTS_EV_TYPE_DRV_SEL && state->driver.select->inps ) {
+            inps = state->driver.select->inps;
+        } else {
+            inps = ERTS_POLLSET_IX(((ErtsRunQueue *) erts_smp_atomic_read_nob(
+                    &erts_drvport2port(ix)->run_queue))->ix)->ps;
+        }
+        new_events |= ERTS_CIO_POLL_CTL(inps, state->fd, ERTS_POLL_EV_IN, on, &wake_poller_cmd);
+        wake_poller_res |= wake_poller_cmd;
+    }
+    if (ctl_events & ERTS_POLL_EV_OUT) {
+        wake_poller_cmd = wake_poller;
+        if(state->type == ERTS_EV_TYPE_DRV_SEL && state->driver.select->outps ) {
+            outps = state->driver.select->outps;
+        } else {
+            outps = ERTS_POLLSET_IX(((ErtsRunQueue *) erts_smp_atomic_read_nob(
+                    &erts_drvport2port(ix)->run_queue))->ix)->ps;
+        }
+        new_events |= ERTS_CIO_POLL_CTL(outps, state->fd, ERTS_POLL_EV_OUT, on, &wake_poller_cmd);
+        wake_poller_res |= wake_poller_cmd;
+    }
+    wake_poller = wake_poller_res;
+    }
+#else
+    new_events = ERTS_CIO_POLL_CTL(inps, state->fd, ctl_events, on, &wake_poller);
+#endif
 
     if (new_events & (ERTS_POLL_EV_ERR|ERTS_POLL_EV_NVAL)) {
 	if (state->type == ERTS_EV_TYPE_DRV_SEL && !state->events) {
@@ -625,15 +974,32 @@ ERTS_CIO_EXPORT(driver_select)(ErlDrvPort ix,
 		dsdsp->outport = NIL;
 		erts_port_task_handle_init(&dsdsp->intask);
 		erts_port_task_handle_init(&dsdsp->outtask);
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+		dsdsp->inps = NULL;
+		dsdsp->outps = NULL;
+#endif
 		ASSERT(state->driver.select == NULL);
 		state->driver.select = dsdsp;
 		state->type = ERTS_EV_TYPE_DRV_SEL;
 	    }
 	    ASSERT(state->type == ERTS_EV_TYPE_DRV_SEL);
-	    if (ctl_events & ERTS_POLL_EV_IN)
+	    if (ctl_events & ERTS_POLL_EV_IN) {
 		state->driver.select->inport = id;
-	    if (ctl_events & ERTS_POLL_EV_OUT)
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+		state->driver.select->inps = inps;
+#endif
+	    }
+	    if (ctl_events & ERTS_POLL_EV_OUT) {
 		state->driver.select->outport = id;
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+		state->driver.select->outps = outps;
+#endif
+	    }
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+	    if (ctl_events & (ERTS_POLL_EV_IN|ERTS_POLL_EV_OUT)) {
+            add_selected_fd(ix, state);
+	    }
+#endif
 	    if (mode & ERL_DRV_USE) {
 		state->flags |= ERTS_EV_FLAG_USED;
 	    }
@@ -643,16 +1009,30 @@ ERTS_CIO_EXPORT(driver_select)(ErlDrvPort ix,
 		if (ctl_events & ERTS_POLL_EV_IN) {
 		    abort_tasks(state, ERL_DRV_READ);
 		    state->driver.select->inport = NIL;
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+            state->driver.select->inps = NULL;
+#endif
 		}
 		if (ctl_events & ERTS_POLL_EV_OUT) {
 		    abort_tasks(state, ERL_DRV_WRITE);
 		    state->driver.select->outport = NIL;
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+            state->driver.select->outps = NULL;
+#endif
 		}
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+	    if (ctl_events & (ERTS_POLL_EV_IN|ERTS_POLL_EV_OUT)) {
+	        if( state->driver.select->inport != id &&
+                state->driver.select->outport != id) {
+            del_selected_fd(ix, state);
+            }
+	    }
+#endif
 		if (new_events == 0) {
 		    ASSERT(!erts_port_task_is_scheduled(&state->driver.select->intask));
 		    ASSERT(!erts_port_task_is_scheduled(&state->driver.select->outtask));
 		    if (old_events != 0) {
-			remember_removed(state, &pollset);
+			remember_removed(state, &deselected);
 		    }		    
 		    if ((mode & ERL_DRV_USE) || !(state->flags & ERTS_EV_FLAG_USED)) {
 			state->type = ERTS_EV_TYPE_NONE;
@@ -723,9 +1103,14 @@ ERTS_CIO_EXPORT(driver_event)(ErlDrvPort ix,
     ErtsDrvEventState *state;
     int do_wake = 0;
     int ret;
+    ErtsPollSet ps;
 
     ERTS_SMP_LC_ASSERT(erts_drvport2port(ix)
 		       && erts_lc_is_port_locked(erts_drvport2port(ix)));
+
+#if !defined(ERTS_SMP) || !defined(ERTS_POLLSET_PER_SCHEDULER)
+    ps = ERTS_POLLSET_IX(0)->ps;
+#endif
 
 #ifdef ERTS_SYS_CONTINOUS_FD_NUMBERS
     if ((unsigned)fd >= (unsigned)erts_smp_atomic_read_nob(&drv_ev_state_len)) {
@@ -769,6 +1154,15 @@ ERTS_CIO_EXPORT(driver_event)(ErlDrvPort ix,
     ASSERT(state->type == ERTS_EV_TYPE_DRV_EV
 	   || state->type == ERTS_EV_TYPE_NONE);
 
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+    if(state->type == ERTS_EV_TYPE_DRV_EV && state->driver.event->ps ) {
+        ps = state->driver.event->ps;
+    } else {
+        ps = ERTS_POLLSET_IX(((ErtsRunQueue *) erts_smp_atomic_read_nob(
+                &erts_drvport2port(ix)->run_queue))->ix)->ps;
+    }
+#endif
+
     events = state->events;
 
     if (!event_data) {
@@ -781,14 +1175,14 @@ ERTS_CIO_EXPORT(driver_event)(ErlDrvPort ix,
     }
 
     if (add_events) {
-	events = ERTS_CIO_POLL_CTL(pollset.ps, state->fd, add_events, 1, &do_wake);
+	events = ERTS_CIO_POLL_CTL(ps, state->fd, add_events, 1, &do_wake);
 	if (events & (ERTS_POLL_EV_ERR|ERTS_POLL_EV_NVAL)) {
 	    ret = -1;
 	    goto done;
 	}
     }
     if (remove_events) {
-	events = ERTS_CIO_POLL_CTL(pollset.ps, state->fd, remove_events, 0, &do_wake);
+	events = ERTS_CIO_POLL_CTL(ps, state->fd, remove_events, 0, &do_wake);
 	if (events & (ERTS_POLL_EV_ERR|ERTS_POLL_EV_NVAL)) {
 	    ret = -1;
 	    goto done;
@@ -806,7 +1200,13 @@ ERTS_CIO_EXPORT(driver_event)(ErlDrvPort ix,
 	    erts_port_task_handle_init(&state->driver.event->task);
 	    state->driver.event->port = id;
 	    state->driver.event->removed_events = (ErtsPollEvents) 0;
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+		state->driver.event->ps = ps;
+#endif
 	    state->type = ERTS_EV_TYPE_DRV_EV;
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+	    add_selected_fd(ix, state);
+#endif
 	}
 	state->driver.event->data = event_data;
     }
@@ -818,7 +1218,10 @@ ERTS_CIO_EXPORT(driver_event)(ErlDrvPort ix,
 	}
 	state->driver.select = NULL;
 	state->type = ERTS_EV_TYPE_NONE;
-	remember_removed(state, &pollset);
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+	del_selected_fd(ix, state);
+#endif
+	remember_removed(state, &deselected);
     }
     state->events = events;
     ASSERT(event_data ? events == event_data->events : events == 0); 
@@ -1095,38 +1498,38 @@ event_large_fd_error(ErlDrvPort ix, ErtsSysFdType fd, ErlDrvEventData event_data
 #endif
 
 static ERTS_INLINE void
-iready(Eterm id, ErtsDrvEventState *state)
+iready(Eterm id, ErtsDrvEventState *state, int ix)
 {
     if (erts_port_task_schedule(id,
 				&state->driver.select->intask,
 				ERTS_PORT_TASK_INPUT,
 				(ErlDrvEvent) state->fd,
-				NULL) != 0) {
+				NULL, ix) != 0) {
 	stale_drv_select(id, state, ERL_DRV_READ);
     }
 }
 
 static ERTS_INLINE void
-oready(Eterm id, ErtsDrvEventState *state)
+oready(Eterm id, ErtsDrvEventState *state, int ix)
 {
     if (erts_port_task_schedule(id,
 				&state->driver.select->outtask,
 				ERTS_PORT_TASK_OUTPUT,
 				(ErlDrvEvent) state->fd,
-				NULL) != 0) {
+				NULL, ix) != 0) {
 	stale_drv_select(id, state, ERL_DRV_WRITE);
     }
 }
 
 #if ERTS_CIO_HAVE_DRV_EVENT
 static ERTS_INLINE void
-eready(Eterm id, ErtsDrvEventState *state, ErlDrvEventData event_data)
+eready(Eterm id, ErtsDrvEventState *state, ErlDrvEventData event_data, int ix)
 {
     if (erts_port_task_schedule(id,
 				&state->driver.event->task,
 				ERTS_PORT_TASK_EVENT,
 				(ErlDrvEvent) state->fd,
-				event_data) != 0) {
+				event_data, ix) != 0) {
 	stale_drv_select(id, state, 0);
     }
 }
@@ -1134,34 +1537,52 @@ eready(Eterm id, ErtsDrvEventState *state, ErlDrvEventData event_data)
 
 static void bad_fd_in_pollset( ErtsDrvEventState *, Eterm, Eterm, ErtsPollEvents);
 
+
+void
+ERTS_CIO_EXPORT(erts_check_io_interrupt_rq)(int ix, int set)
+{
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+    ERTS_CIO_POLL_INTR(ERTS_POLLSET_IX(ix)->ps, set);
+#else
+    ERTS_CIO_POLL_INTR(ERTS_POLLSET_IX(0)->ps, set);
+#endif
+}
+
 #ifdef ERTS_POLL_NEED_ASYNC_INTERRUPT_SUPPORT
 void
 ERTS_CIO_EXPORT(erts_check_io_async_sig_interrupt)(void)
 {
-    ERTS_CIO_POLL_AS_INTR(pollset.ps);
+    ERTS_CIO_POLL_AS_INTR(ERTS_POLLSET_IX(0)->ps); /* rq 0 never block*/
 }
 #endif
 
 void
 ERTS_CIO_EXPORT(erts_check_io_interrupt)(int set)
 {
-    ERTS_CIO_POLL_INTR(pollset.ps, set);
+    ERTS_CIO_POLL_INTR(ERTS_POLLSET_IX(0)->ps, set); /* rq 0 never block*/
 }
 
 void
 ERTS_CIO_EXPORT(erts_check_io_interrupt_timed)(int set,
 					       erts_short_time_t msec)
 {
-    ERTS_CIO_POLL_INTR_TMD(pollset.ps, set, msec);
+    ERTS_CIO_POLL_INTR_TMD(ERTS_POLLSET_IX(0)->ps, set, msec); /* rq 0 never block*/
 }
 
 void
-ERTS_CIO_EXPORT(erts_check_io)(int do_wait)
+ERTS_CIO_EXPORT(erts_check_io)(int ix, int do_wait)
 {
+    struct pollset_info *psi;
     ErtsPollResFd pollres[256];
     int pollres_len;
     SysTimeval wait_time;
     int poll_ret, i;
+    
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+    psi = ERTS_POLLSET_IX(ix);
+#else
+    psi = ERTS_POLLSET_IX(0);
+#endif
 
  restart:
 
@@ -1183,9 +1604,9 @@ ERTS_CIO_EXPORT(erts_check_io)(int do_wait)
 #endif
     pollres_len = sizeof(pollres)/sizeof(ErtsPollResFd);
 
-    erts_smp_atomic_set_nob(&pollset.in_poll_wait, 1);
+    erts_smp_atomic_set_nob(&psi->in_poll_wait, 1);
 
-    poll_ret = ERTS_CIO_POLL_WAIT(pollset.ps, pollres, &pollres_len, &wait_time);
+    poll_ret = ERTS_CIO_POLL_WAIT(psi->ps, pollres, &pollres_len, &wait_time);
 
 #ifdef ERTS_ENABLE_LOCK_CHECK
     erts_lc_check_exact(NULL, 0); /* No locks should be locked */
@@ -1199,8 +1620,8 @@ ERTS_CIO_EXPORT(erts_check_io)(int do_wait)
 #endif
 
     if (poll_ret != 0) {
-	erts_smp_atomic_set_nob(&pollset.in_poll_wait, 0);
-	forget_removed(&pollset);
+	erts_smp_atomic_set_nob(&psi->in_poll_wait, 0);
+	forget_removed(&deselected);
 	if (poll_ret == EAGAIN) {
 	    goto restart;
 	}
@@ -1249,6 +1670,16 @@ ERTS_CIO_EXPORT(erts_check_io)(int do_wait)
 	    revent_mask |= state->events;
 	    revents = pollres[i].events & revent_mask;
 
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+        /* port may be deselected */
+        if (revents & ERTS_POLL_EV_IN && is_nil(state->driver.select->inport)) {
+            revents &= ~ERTS_POLL_EV_IN;
+        }
+        if (revents & ERTS_POLL_EV_OUT && is_nil(state->driver.select->outport)) {
+            revents &= ~ERTS_POLL_EV_OUT;
+        }
+#endif
+
 	    if (revents & ERTS_POLL_EV_ERR) {
 		/*
 		 * Let the driver handle the error condition. Only input,
@@ -1260,15 +1691,15 @@ ERTS_CIO_EXPORT(erts_check_io)(int do_wait)
 		if ((revents & ERTS_POLL_EV_IN)
 		    || (!(revents & ERTS_POLL_EV_OUT)
 			&& state->events & ERTS_POLL_EV_IN)) {
-		    iready(state->driver.select->inport, state);
+		    iready(state->driver.select->inport, state, ix);
 		}
 		else if (state->events & ERTS_POLL_EV_OUT) {
-		    oready(state->driver.select->outport, state);
+		    oready(state->driver.select->outport, state, ix);
 		}
 	    }
 	    else if (revents & (ERTS_POLL_EV_IN|ERTS_POLL_EV_OUT)) {
 		if (revents & ERTS_POLL_EV_OUT) {
-		    oready(state->driver.select->outport, state);
+		    oready(state->driver.select->outport, state, ix);
 		}
 		/* Someone might have deselected input since revents
 		   was read (true also on the non-smp emulator since
@@ -1276,7 +1707,7 @@ ERTS_CIO_EXPORT(erts_check_io)(int do_wait)
 		   revents... */
 		revents &= ~(~state->events & ERTS_POLL_EV_IN);
 		if (revents & ERTS_POLL_EV_IN) {
-		    iready(state->driver.select->inport, state);
+		    iready(state->driver.select->inport, state, ix);
 		}
 	    }
 	    else if (revents & ERTS_POLL_EV_NVAL) {
@@ -1297,12 +1728,19 @@ ERTS_CIO_EXPORT(erts_check_io)(int do_wait)
 	    event_data = state->driver.event->data;
 	    revents = pollres[i].events;
 	    revents &= ~state->driver.event->removed_events;
+	    
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+        /* port maybe deselected */
+        if(is_nil(state->driver.event->port)) {
+            goto next_pollres;
+        }
+#endif
 
 	    if (revents) {
 		event_data->events = state->events;
 		event_data->revents = revents;
 
-		eready(state->driver.event->port, state, event_data);
+		eready(state->driver.event->port, state, event_data, ix);
 	    }
 	    break;
 	}
@@ -1330,8 +1768,8 @@ ERTS_CIO_EXPORT(erts_check_io)(int do_wait)
 #endif
     }
 
-    erts_smp_atomic_set_nob(&pollset.in_poll_wait, 0);
-    forget_removed(&pollset);
+    erts_smp_atomic_set_nob(&psi->in_poll_wait, 0);
+    forget_removed(&deselected);
 }
 
 static void
@@ -1445,14 +1883,28 @@ static void drv_ev_state_free(void *des)
 void
 ERTS_CIO_EXPORT(erts_init_check_io)(void)
 {
-    erts_smp_atomic_init_nob(&pollset.in_poll_wait, 0);
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+    int n = erts_no_schedulers;
+#else
+    int n = 1;
+#endif
+    int ix;
+
     ERTS_CIO_POLL_INIT();
-    pollset.ps = ERTS_CIO_NEW_POLLSET();
+    
+    erts_pollsets = erts_alloc(ERTS_ALC_T_UNDEF,
+				n * sizeof(struct pollset_info));
+    for (ix = 0; ix < n; ix ++) {
+        struct pollset_info *pollset = ERTS_POLLSET_IX(ix);
+        erts_smp_atomic_init_nob(&pollset->in_poll_wait, 0);
+        pollset->ps = ERTS_CIO_NEW_POLLSET();
+    }
+    erts_no_pollsets = n;
 
 #ifdef ERTS_SMP
     init_removed_fd_alloc();
-    pollset.removed_list = NULL;
-    erts_smp_spinlock_init(&pollset.removed_list_lock,
+    deselected.removed_list = NULL;
+    erts_smp_spinlock_init(&deselected.removed_list_lock,
 			   "pollset_rm_list");
     {
 	int i;
@@ -1465,6 +1917,7 @@ ERTS_CIO_EXPORT(erts_init_check_io)(void)
 	}
     }
 #endif
+
 #ifdef ERTS_SYS_CONTINOUS_FD_NUMBERS
     max_fds = ERTS_CIO_POLL_MAX_FDS();
     erts_smp_atomic_init_nob(&drv_ev_state_len, 0);
@@ -1485,6 +1938,11 @@ ERTS_CIO_EXPORT(erts_init_check_io)(void)
 		       DRV_EV_STATE_HTAB_SIZE, hf);
     }
 #endif
+
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+    init_selected_fd_alloc();
+    sfl_tab = NULL;
+#endif
 }
 
 int
@@ -1500,10 +1958,14 @@ ERTS_CIO_EXPORT(erts_check_io_max_files)(void)
 Uint
 ERTS_CIO_EXPORT(erts_check_io_size)(void)
 {
-    Uint res;
+    Uint res = 0;
     ErtsPollInfo pi;
-    ERTS_CIO_POLL_INFO(pollset.ps, &pi);
-    res = pi.memory_size;
+    
+    int ix;
+    for (ix = 0; ix < erts_no_pollsets; ix++ ) {
+        ERTS_CIO_POLL_INFO(ERTS_POLLSET_IX(ix)->ps, &pi);
+        res += pi.memory_size;
+    }
 #ifdef ERTS_SYS_CONTINOUS_FD_NUMBERS
     res += sizeof(ErtsDrvEventState) * erts_smp_atomic_read_nob(&drv_ev_state_len);
 #else
@@ -1525,12 +1987,28 @@ ERTS_CIO_EXPORT(erts_check_io_info)(void *proc)
 {
     Process *p = (Process *) proc;
     Eterm tags[15], values[15], res;
-    Uint sz, *szp, *hp, **hpp, memory_size;
+    Uint sz, *szp, *hp, **hpp;
+    Uint memory_size = 0, poll_set_size = 0, fallback_poll_set_size = 0, pending_updates = 0;
+#ifdef ERTS_POLL_COUNT_AVOIDED_WAKEUPS
+    Uint no_avoided_wakeups = 0, no_avoided_interrupts = 0, no_interrupt_timed = 0;
+#endif
     Sint i;
     ErtsPollInfo pi;
     
-    ERTS_CIO_POLL_INFO(pollset.ps, &pi);
-    memory_size = pi.memory_size;
+    int ix;
+    for (ix = 0 ; ix < erts_no_pollsets; ix++ ) {
+        ERTS_CIO_POLL_INFO(ERTS_POLLSET_IX(ix)->ps, &pi);
+        memory_size += pi.memory_size;
+        poll_set_size += pi.poll_set_size;
+        fallback_poll_set_size += pi.fallback_poll_set_size;
+        pending_updates += pi.pending_updates;
+#ifdef ERTS_POLL_COUNT_AVOIDED_WAKEUPS
+        no_avoided_wakeups += pi.no_avoided_wakeups;
+        no_avoided_interrupts += pi.no_avoided_interrupts;
+        no_interrupt_timed += pi.no_interrupt_timed;
+#endif
+    }
+    
 #ifdef ERTS_SYS_CONTINOUS_FD_NUMBERS
     memory_size += sizeof(ErtsDrvEventState) * erts_smp_atomic_read_nob(&drv_ev_state_len);
 #else
@@ -1569,11 +2047,11 @@ ERTS_CIO_EXPORT(erts_check_io_info)(void *proc)
     values[i++] = erts_bld_uint(hpp, szp, memory_size);
 
     tags[i] = erts_bld_atom(hpp, szp, "total_poll_set_size");
-    values[i++] = erts_bld_uint(hpp, szp, (Uint) pi.poll_set_size);
+    values[i++] = erts_bld_uint(hpp, szp, poll_set_size);
 
     if (pi.fallback) {
 	tags[i] = erts_bld_atom(hpp, szp, "fallback_poll_set_size");
-	values[i++] = erts_bld_uint(hpp, szp, (Uint) pi.fallback_poll_set_size);
+	values[i++] = erts_bld_uint(hpp, szp, fallback_poll_set_size);
     }
 
     tags[i] = erts_bld_atom(hpp, szp, "lazy_updates");
@@ -1581,7 +2059,7 @@ ERTS_CIO_EXPORT(erts_check_io_info)(void *proc)
 
     if (pi.lazy_updates) {
 	tags[i] = erts_bld_atom(hpp, szp, "pending_updates");
-	values[i++] = erts_bld_uint(hpp, szp, (Uint) pi.pending_updates);
+	values[i++] = erts_bld_uint(hpp, szp, pending_updates);
     }
 
     tags[i] = erts_bld_atom(hpp, szp, "batch_updates");
@@ -1595,13 +2073,13 @@ ERTS_CIO_EXPORT(erts_check_io_info)(void *proc)
 
 #ifdef ERTS_POLL_COUNT_AVOIDED_WAKEUPS
     tags[i] = erts_bld_atom(hpp, szp, "no_avoided_wakeups");
-    values[i++] = erts_bld_uint(hpp, szp, (Uint) pi.no_avoided_wakeups);
+    values[i++] = erts_bld_uint(hpp, szp, no_avoided_wakeups);
 
     tags[i] = erts_bld_atom(hpp, szp, "no_avoided_interrupts");
-    values[i++] = erts_bld_uint(hpp, szp, (Uint) pi.no_avoided_interrupts);
+    values[i++] = erts_bld_uint(hpp, szp, no_avoided_interrupts);
 
     tags[i] = erts_bld_atom(hpp, szp, "no_interrupt_timed");
-    values[i++] = erts_bld_uint(hpp, szp, (Uint) pi.no_interrupt_timed);
+    values[i++] = erts_bld_uint(hpp, szp, no_interrupt_timed);
 #endif
 
     res = erts_bld_2tup_list(hpp, szp, i, tags, values);
@@ -1887,6 +2365,8 @@ ERTS_CIO_EXPORT(erts_check_io_debug)(void)
     int fd, len;
 #endif
     IterDebugCounters counters;
+    ErtsPollEvents *mask;
+    int i, ix;
     ErtsDrvEventState null_des;
 
     null_des.driver.select = NULL;
@@ -1904,7 +2384,18 @@ ERTS_CIO_EXPORT(erts_check_io_debug)(void)
 
 #ifdef ERTS_SYS_CONTINOUS_FD_NUMBERS
     counters.epep = erts_alloc(ERTS_ALC_T_TMP, sizeof(ErtsPollEvents)*max_fds);
-    ERTS_POLL_EXPORT(erts_poll_get_selected_events)(pollset.ps, counters.epep, max_fds);
+    mask = erts_alloc(ERTS_ALC_T_TMP, sizeof(ErtsPollEvents)*max_fds);
+    for (ix = 0; ix < erts_no_pollsets; ix++ ) {
+        for (i = 0; i < max_fds; i++ ) {
+            mask[i] = 0;
+        }
+        ERTS_POLL_EXPORT(erts_poll_get_selected_events)(
+            ERTS_POLLSET_IX(ix)->ps, mask, max_fds);
+        for (i = 0; i < max_fds; i++ ) {
+            counters.epep[i] |= mask[i];
+        }
+    }
+    erts_free(ERTS_ALC_T_TMP, (void*) mask);
     counters.internal_fds = 0;
 #endif
     counters.used_fds = 0;

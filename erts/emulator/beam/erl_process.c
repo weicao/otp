@@ -1066,14 +1066,22 @@ erts_sched_finish_poke(ErtsSchedulerSleepInfo *ssi, erts_aint32_t flags)
 {
     switch (flags & ERTS_SSI_FLGS_SLEEP_TYPE) {
     case ERTS_SSI_FLG_POLL_SLEEPING:
-	erts_sys_schedule_interrupt(1);
+#ifdef ERTS_POLLSET_PER_SCHEDULER
+    erts_sys_schedule_interrupt_rq(ssi->ix, 1);
+#else
+    erts_sys_schedule_interrupt(1);
+#endif
 	break;
     case ERTS_SSI_FLG_POLL_SLEEPING|ERTS_SSI_FLG_TSE_SLEEPING:
 	/*
 	 * Thread progress blocking while poll sleeping; need
 	 * to signal on both...
 	 */
-	erts_sys_schedule_interrupt(1);
+#ifdef ERTS_POLLSET_PER_SCHEDULER
+    erts_sys_schedule_interrupt_rq(ssi->ix, 1);
+#else
+    erts_sys_schedule_interrupt(1);
+#endif
 	/* fall through */
     case ERTS_SSI_FLG_TSE_SLEEPING:
 	erts_tse_set(ssi->event);
@@ -1106,7 +1114,7 @@ set_aux_work_flags_wakeup_nob(ErtsSchedulerSleepInfo *ssi,
 #ifdef ERTS_SMP
 	    erts_sched_poke(ssi);
 #else
-	    erts_sys_schedule_interrupt(1);
+        erts_sys_schedule_interrupt(1);
 #endif
 	}
     }
@@ -1126,7 +1134,7 @@ set_aux_work_flags_wakeup_relb(ErtsSchedulerSleepInfo *ssi,
 #ifdef ERTS_SMP
 	erts_sched_poke(ssi);
 #else
-	erts_sys_schedule_interrupt(1);
+    erts_sys_schedule_interrupt(1);
 #endif
     }
 }
@@ -2075,18 +2083,33 @@ try_set_sys_scheduling(void)
     return 0 == erts_smp_atomic32_cmpxchg_acqb(&doing_sys_schedule, 1, 0);
 }
 
+#ifdef ERTS_POLLSET_PER_SCHEDULER
+
+static ERTS_INLINE int
+runq_have_outstanding_io_tasks(ErtsRunQueue* rq)
+{
+    return 0 != erts_smp_atomic_read_acqb(&rq->ports.outstanding_io_tasks);
+}
+
+#endif
+
 #endif
 
 static ERTS_INLINE int
-prepare_for_sys_schedule(void)
+prepare_for_sys_schedule(ErtsRunQueue *rq)
 {
 #ifdef ERTS_SMP
+#ifdef ERTS_POLLSET_PER_SCHEDULER
+    if (!runq_have_outstanding_io_tasks(rq))
+        return 1;
+#else
     while (!erts_port_task_have_outstanding_io_tasks()
 	   && try_set_sys_scheduling()) {
 	if (!erts_port_task_have_outstanding_io_tasks())
 	    return 1;
 	clear_sys_scheduling();
     }
+#endif
     return 0;
 #else
     return !erts_port_task_have_outstanding_io_tasks();
@@ -2239,7 +2262,11 @@ sched_set_sleeptype(ErtsSchedulerSleepInfo *ssi, erts_aint32_t sleep_type)
 	erts_tse_reset(ssi->event);
     else {
 	ASSERT(sleep_type == ERTS_SSI_FLG_POLL_SLEEPING);
-	erts_sys_schedule_interrupt(0);
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+    erts_sys_schedule_interrupt_rq(ssi->ix, 0);
+#else
+    erts_sys_schedule_interrupt(0);
+#endif
     }
 
     while (1) {
@@ -2395,7 +2422,7 @@ scheduler_wait(int *fcalls, ErtsSchedulerData *esdp, ErtsRunQueue *rq)
      * be waiting in erl_sys_schedule()
      */
 
-    if (!prepare_for_sys_schedule()) {
+    if (!prepare_for_sys_schedule(rq)) {
 
 	sched_waiting(esdp->no, rq);
 
@@ -2500,9 +2527,12 @@ scheduler_wait(int *fcalls, ErtsSchedulerData *esdp, ErtsRunQueue *rq)
 	    if (working)
 		sched_wall_time_change(esdp, working = 0);
 
+        
+#ifndef ERTS_POLLSET_PER_SCHEDULER
 	    ASSERT(!erts_port_task_have_outstanding_io_tasks());
+#endif
 
-	    erl_sys_schedule(1); /* Might give us something to do */
+	    erl_sys_schedule(rq->ix, 1); /* Might give us something to do */
 
 	    dt = erts_do_time_read_and_reset();
 	    if (dt) erts_bump_timer(dt);
@@ -2541,13 +2571,17 @@ scheduler_wait(int *fcalls, ErtsSchedulerData *esdp, ErtsRunQueue *rq)
 	     * If we got new I/O tasks we aren't allowed to
 	     * call erl_sys_schedule() until it is handled.
 	     */
+#ifdef ERTS_POLLSET_PER_SCHEDULER
+        if (runq_have_outstanding_io_tasks(rq)) {
+#else
 	    if (erts_port_task_have_outstanding_io_tasks()) {
+#endif
 		clear_sys_scheduling();
 		/*
 		 * Got to check that we still got I/O tasks; otherwise
 		 * we have to continue checking for I/O...
 		 */
-		if (!prepare_for_sys_schedule()) {
+		if (!prepare_for_sys_schedule(rq)) {
 		    spincount *= ERTS_SCHED_TSE_SLEEP_SPINCOUNT_FACT;
 		    goto tse_wait;
 		}
@@ -2562,14 +2596,18 @@ scheduler_wait(int *fcalls, ErtsSchedulerData *esdp, ErtsRunQueue *rq)
 	 * If we got new I/O tasks we aren't allowed to
 	 * sleep in erl_sys_schedule().
 	 */
+#ifdef ERTS_POLLSET_PER_SCHEDULER
+    if (runq_have_outstanding_io_tasks(rq)) {
+#else
 	if (erts_port_task_have_outstanding_io_tasks()) {
+#endif
 	    clear_sys_scheduling();
 
 	    /*
 	     * Got to check that we still got I/O tasks; otherwise
 	     * we have to wait in erl_sys_schedule() after all...
 	     */
-	    if (!prepare_for_sys_schedule()) {
+	    if (!prepare_for_sys_schedule(rq)) {
 		/*
 		 * Not allowed to wait in erl_sys_schedule;
 		 * do tse wait instead...
@@ -2598,7 +2636,9 @@ scheduler_wait(int *fcalls, ErtsSchedulerData *esdp, ErtsRunQueue *rq)
 		ASSERT(!(flgs & ERTS_SSI_FLG_SLEEPING));
 		goto sys_woken;
 	    }
+#ifndef ERTS_POLLSET_PER_SCHEDULER
 	    ASSERT(!erts_port_task_have_outstanding_io_tasks());
+#endif
 	    goto sys_poll_aux_work;
 	}
 
@@ -2616,9 +2656,11 @@ scheduler_wait(int *fcalls, ErtsSchedulerData *esdp, ErtsRunQueue *rq)
 	    erts_thr_progress_active(esdp, thr_prgr_active = 0);
 #endif
 
+#ifndef ERTS_POLLSET_PER_SCHEDULER
 	ASSERT(!erts_port_task_have_outstanding_io_tasks());
+#endif
 
-	erl_sys_schedule(0);
+	erl_sys_schedule(rq->ix, 0);
 
 	dt = erts_do_time_read_and_reset();
 	if (dt) erts_bump_timer(dt);
@@ -2969,7 +3011,7 @@ check_immigration_need(ErtsRunQueue *c_rq, ErtsMigrationPath *mp, int prio)
     int len;
     Uint32 f_flags, f_rq_flags;
     ErtsRunQueue *f_rq;
-
+    
     f_flags = mp->prio[prio].flags;
 
     ASSERT(ERTS_CHK_RUNQ_FLG_IMMIGRATE(mp->flags, prio));
@@ -3054,10 +3096,17 @@ immigrate(ErtsRunQueue *c_rq, ErtsMigrationPath *mp)
 	    if (prio == ERTS_PORT_PRIO_LEVEL) {
 		Port *prt;
 		prt = erts_dequeue_port(rq);
-		if (prt)
+		if (prt) {
+#ifdef ERTS_POLLSET_PER_SCHEDULER
+		    erts_transfer_outstanding_io_tasks(prt, rq, c_rq);
+#endif
 		    RUNQ_SET_RQ(&prt->run_queue, c_rq);
+		}
 		erts_smp_runq_unlock(rq);
 		if (prt) {
+#ifdef ERTS_POLLSET_PER_SCHEDULER
+			erts_change_port_pollset(prt->id, c_rq->ix);
+#endif
 		    /* port might terminate while we have no lock... */
 		    rq = erts_port_runq(prt);
 		    if (rq) {
@@ -3226,8 +3275,14 @@ evacuate_run_queue(ErtsRunQueue *rq,
 	while (prt) {
 	    ErtsRunQueue *prt_rq;
 	    prt = erts_dequeue_port(rq);
+#ifdef ERTS_POLLSET_PER_SCHEDULER
+	    erts_transfer_outstanding_io_tasks(prt, rq, to_rq);
+#endif
 	    RUNQ_SET_RQ(&prt->run_queue, to_rq);
 	    erts_smp_runq_unlock(rq);
+#ifdef ERTS_POLLSET_PER_SCHEDULER
+		erts_change_port_pollset(prt->id, to_rq->ix);
+#endif
 	    /*
 	     * The port might terminate while
 	     * we have no lock on it...
@@ -3372,12 +3427,17 @@ no_procs:
     /*
      * Check for a runnable port to steal...
      */
-
     if (vrq->ports.start) {
 	ErtsRunQueue *prt_rq;
 	Port *prt = erts_dequeue_port(vrq);
+#ifdef ERTS_POLLSET_PER_SCHEDULER
+	erts_transfer_outstanding_io_tasks(prt, vrq, rq);
+#endif
 	RUNQ_SET_RQ(&prt->run_queue, rq);
 	erts_smp_runq_unlock(vrq);
+#ifdef ERTS_POLLSET_PER_SCHEDULER
+    erts_change_port_pollset(prt->id, rq->ix);
+#endif
 
 	/*
 	 * The port might terminate while
@@ -3397,7 +3457,6 @@ no_procs:
 	    return !0;
 	}
     }
-
     erts_smp_runq_unlock(vrq);
 
     return 0;
@@ -4637,6 +4696,10 @@ erts_init_scheduling(int no_schedulers, int no_schedulers_online)
 	rq->ports.info.reds = 0;
 	rq->ports.start = NULL;
 	rq->ports.end = NULL;
+	
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+    erts_smp_atomic_init_nob(&rq->ports.outstanding_io_tasks, 0);
+#endif	
     }
 
 #ifdef ERTS_SMP
@@ -4672,6 +4735,7 @@ erts_init_scheduling(int no_schedulers, int no_schedulers_online)
 	ssi->next = NULL;
 	ssi->prev = NULL;
 #endif
+    ssi->ix = ix-1;
 	erts_smp_atomic32_init_nob(&ssi->flags, 0);
 	ssi->event = NULL; /* initialized in sched_thread_func */
 #endif
@@ -6980,7 +7044,7 @@ Process *schedule(Process *p, int calls)
 
 	    goto check_activities_to_run;
 	}
-	else if (fcalls > input_reductions && prepare_for_sys_schedule()) {
+	else if (fcalls > input_reductions && prepare_for_sys_schedule(rq)) {
 	    /*
 	     * Schedule system-level activities.
 	     */
@@ -6988,13 +7052,15 @@ Process *schedule(Process *p, int calls)
 	    erts_smp_atomic32_set_relb(&function_calls, 0);
 	    fcalls = 0;
 
+#ifndef ERTS_POLLSET_PER_SCHEDULER
 	    ASSERT(!erts_port_task_have_outstanding_io_tasks());
+#endif
 
 #if 0 /* Not needed since we wont wait in sys schedule */
 	    erts_sys_schedule_interrupt(0);
 #endif
 	    erts_smp_runq_unlock(rq);
-	    erl_sys_schedule(1);
+	    erl_sys_schedule(rq->ix, 1);
 	    dt = erts_do_time_read_and_reset();
 	    if (dt) erts_bump_timer(dt);
 

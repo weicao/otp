@@ -263,10 +263,14 @@ int erts_use_kernel_poll = 0;
 struct {
     int (*select)(ErlDrvPort, ErlDrvEvent, int, int);
     int (*event)(ErlDrvPort, ErlDrvEvent, ErlDrvEventData);
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+    int (*check_io_change_port_pollset)(Eterm, int);
+#endif
     void (*check_io_as_interrupt)(void);
+    void (*check_io_interrupt_rq)(int, int);
     void (*check_io_interrupt)(int);
     void (*check_io_interrupt_tmd)(int, erts_short_time_t);
-    void (*check_io)(int);
+    void (*check_io)(int, int);
     Uint (*size)(void);
     Eterm (*info)(void *);
     int (*check_io_debug)(void);
@@ -303,9 +307,13 @@ init_check_io(void)
     if (erts_use_kernel_poll) {
 	io_func.select			= driver_select_kp;
 	io_func.event			= driver_event_kp;
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+    io_func.check_io_change_port_pollset   = erts_check_io_change_port_pollset_kp;
+#endif
 #ifdef ERTS_POLL_NEED_ASYNC_INTERRUPT_SUPPORT
 	io_func.check_io_as_interrupt	= erts_check_io_async_sig_interrupt_kp;
 #endif
+    io_func.check_io_interrupt_rq	= erts_check_io_interrupt_rq_kp;
 	io_func.check_io_interrupt	= erts_check_io_interrupt_kp;
 	io_func.check_io_interrupt_tmd	= erts_check_io_interrupt_timed_kp;
 	io_func.check_io		= erts_check_io_kp;
@@ -318,9 +326,13 @@ init_check_io(void)
     else {
 	io_func.select			= driver_select_nkp;
 	io_func.event			= driver_event_nkp;
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+    io_func.check_io_change_port_pollset   = erts_check_io_change_port_pollset_nkp;
+#endif
 #ifdef ERTS_POLL_NEED_ASYNC_INTERRUPT_SUPPORT
 	io_func.check_io_as_interrupt	= erts_check_io_async_sig_interrupt_nkp;
 #endif
+    io_func.check_io_interrupt_rq	= erts_check_io_interrupt_rq_nkp;
 	io_func.check_io_interrupt	= erts_check_io_interrupt_nkp;
 	io_func.check_io_interrupt_tmd	= erts_check_io_interrupt_timed_nkp;
 	io_func.check_io		= erts_check_io_nkp;
@@ -332,11 +344,15 @@ init_check_io(void)
     }
 }
 
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+#define ERTS_CHK_IO_CHANGE_PORT_POLLSET (*io_func.check_io_change_port_pollset)
+#endif
 #ifdef ERTS_POLL_NEED_ASYNC_INTERRUPT_SUPPORT
 #define ERTS_CHK_IO_AS_INTR()	(*io_func.check_io_as_interrupt)()
 #else
 #define ERTS_CHK_IO_AS_INTR()	(*io_func.check_io_interrupt)(1)
 #endif
+#define ERTS_CHK_IO_INTR_RQ (*io_func.check_io_interrupt_rq)
 #define ERTS_CHK_IO_INTR	(*io_func.check_io_interrupt)
 #define ERTS_CHK_IO_INTR_TMD	(*io_func.check_io_interrupt_tmd)
 #define ERTS_CHK_IO		(*io_func.check_io)
@@ -351,17 +367,37 @@ init_check_io(void)
     max_files = erts_check_io_max_files();
 }
 
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+#define ERTS_CHK_IO_CHANGE_PORT_POLLSET erts_check_io_change_port_pollset
+#endif
+
 #ifdef ERTS_POLL_NEED_ASYNC_INTERRUPT_SUPPORT
 #define ERTS_CHK_IO_AS_INTR()	erts_check_io_async_sig_interrupt()
 #else
 #define ERTS_CHK_IO_AS_INTR()	erts_check_io_interrupt(1)
 #endif
+#define ERTS_CHK_IO_INTR_RQ erts_check_io_interrupt_rq
 #define ERTS_CHK_IO_INTR	erts_check_io_interrupt
 #define ERTS_CHK_IO_INTR_TMD	erts_check_io_interrupt_timed
 #define ERTS_CHK_IO		erts_check_io
 #define ERTS_CHK_IO_SZ		erts_check_io_size
 
 #endif
+
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+int
+erts_change_port_pollset(Eterm port, int to_rq_ix)
+{
+    return ERTS_CHK_IO_CHANGE_PORT_POLLSET(port, to_rq_ix);
+}
+#endif
+
+void
+erts_sys_schedule_interrupt_rq(int ix, int set)
+{
+    ERTS_CHK_IO_INTR_RQ(ix, set);
+}
+
 
 void
 erts_sys_schedule_interrupt(int set)
@@ -2728,12 +2764,12 @@ child_waiter(void *unused)
  * steps. runnable == 0 iff there are no runnable Erlang processes.
  */
 void
-erl_sys_schedule(int runnable)
+erl_sys_schedule(int ix, int runnable)
 {
 #ifdef ERTS_SMP
-    ERTS_CHK_IO(!runnable);
+    ERTS_CHK_IO(ix, !runnable);
 #else
-    ERTS_CHK_IO(runnable ? 0 : !check_children());
+    ERTS_CHK_IO(ix, runnable ? 0 : !check_children());
 #endif
     ERTS_SMP_LC_ASSERT(!erts_thr_progress_is_blocking());
     (void) check_children();

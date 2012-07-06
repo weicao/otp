@@ -3290,6 +3290,12 @@ void erl_sys_init(void)
 }
 
 void
+erts_sys_schedule_interrupt_rq(int ix, int set)
+{
+    erts_check_io_interrupt_rq(ix, set);
+}
+
+void
 erts_sys_schedule_interrupt(int set)
 {
     erts_check_io_interrupt(set);
@@ -3309,9 +3315,9 @@ erts_sys_schedule_interrupt_timed(int set, erts_short_time_t msec)
  * steps. runnable == 0 iff there are no runnable Erlang processes.
  */
 void
-erl_sys_schedule(int runnable)
+erl_sys_schedule(int ix, int runnable)
 {
-    erts_check_io(!runnable);
+    erts_check_io(ix, !runnable);
     ERTS_SMP_LC_ASSERT(!erts_thr_progress_is_blocking());
 }
 

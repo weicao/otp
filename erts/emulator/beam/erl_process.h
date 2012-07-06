@@ -291,6 +291,7 @@ struct ErtsSchedulerSleepInfo_ {
 #ifdef ERTS_SMP
     ErtsSchedulerSleepInfo *next;
     ErtsSchedulerSleepInfo *prev;
+    int ix;
     erts_smp_atomic32_t flags;
     erts_tse_t *event;
 #endif
@@ -403,6 +404,9 @@ struct ErtsRunQueue_ {
 	ErtsRunQueueInfo info;
 	struct port *start;
 	struct port *end;
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+	erts_smp_atomic_t outstanding_io_tasks;
+#endif
     } ports;
 };
 

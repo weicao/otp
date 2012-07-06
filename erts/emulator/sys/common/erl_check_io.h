@@ -34,6 +34,10 @@ int driver_select_kp(ErlDrvPort, ErlDrvEvent, int, int);
 int driver_select_nkp(ErlDrvPort, ErlDrvEvent, int, int);
 int driver_event_kp(ErlDrvPort, ErlDrvEvent, ErlDrvEventData);
 int driver_event_nkp(ErlDrvPort, ErlDrvEvent, ErlDrvEventData);
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+int erts_check_io_change_port_pollset_kp(Eterm, int);
+int erts_check_io_change_port_pollset_nkp(Eterm, int);
+#endif
 Uint erts_check_io_size_kp(void);
 Uint erts_check_io_size_nkp(void);
 Eterm erts_check_io_info_kp(void *);
@@ -44,12 +48,14 @@ int erts_check_io_max_files_nkp(void);
 void erts_check_io_async_sig_interrupt_kp(void);
 void erts_check_io_async_sig_interrupt_nkp(void);
 #endif
+void erts_check_io_interrupt_rq_kp(int, int);
+void erts_check_io_interrupt_rq_nkp(int, int);
 void erts_check_io_interrupt_kp(int);
 void erts_check_io_interrupt_nkp(int);
 void erts_check_io_interrupt_timed_kp(int, erts_short_time_t);
 void erts_check_io_interrupt_timed_nkp(int, erts_short_time_t);
-void erts_check_io_kp(int);
-void erts_check_io_nkp(int);
+void erts_check_io_kp(int, int);
+void erts_check_io_nkp(int, int);
 void erts_init_check_io_kp(void);
 void erts_init_check_io_nkp(void);
 int erts_check_io_debug_kp(void);
@@ -57,15 +63,19 @@ int erts_check_io_debug_nkp(void);
 
 #else /* !ERTS_ENABLE_KERNEL_POLL */
 
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+int erts_check_io_change_port_pollset(Eterm, int);
+#endif
 Uint erts_check_io_size(void);
 Eterm erts_check_io_info(void *);
 int erts_check_io_max_files(void);
 #ifdef ERTS_POLL_NEED_ASYNC_INTERRUPT_SUPPORT
 void erts_check_io_async_sig_interrupt(void);
 #endif
+void erts_check_io_interrupt_rq(int, int);
 void erts_check_io_interrupt(int);
 void erts_check_io_interrupt_timed(int, erts_short_time_t);
-void erts_check_io(int);
+void erts_check_io(int, int);
 void erts_init_check_io(void);
 
 #endif
@@ -92,6 +102,9 @@ typedef struct {
     ErlDrvEventData data;
     ErtsPollEvents removed_events;
     ErtsPortTaskHandle task;
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+    ErtsPollSet ps;
+#endif
 } ErtsDrvEventDataState;
 
 typedef struct {
@@ -99,5 +112,9 @@ typedef struct {
     Eterm outport;
     ErtsPortTaskHandle intask;
     ErtsPortTaskHandle outtask;
+#if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
+    ErtsPollSet inps;
+    ErtsPollSet outps;
+#endif
 } ErtsDrvSelectDataState;
 #endif /* #ifndef ERL_CHECK_IO_INTERNAL__ */

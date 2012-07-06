@@ -208,7 +208,7 @@ void erts_schedule_dist_command(Port *prt, DistEntry *dist_entry)
 				       &dep->dist_cmd,
 				       ERTS_PORT_TASK_DIST_CMD,
 				       (ErlDrvEvent) -1,
-				       NULL);
+				       NULL, -1);
     }
 }
 
