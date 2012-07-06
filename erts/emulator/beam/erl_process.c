@@ -3093,7 +3093,9 @@ immigrate(ErtsRunQueue *c_rq, ErtsMigrationPath *mp)
 	rq = check_immigration_need(c_rq, mp, prio);
 	if (rq) {
 	    erts_smp_runq_lock(rq);
-	    if (prio == ERTS_PORT_PRIO_LEVEL) {
+	    if (prio == ERTS_PORT_PRIO_LEVEL && 
+            rq->ports.start && 
+            !(ERTS_PORT_SFLG_BOUND & rq->ports.start->status)) {
 		Port *prt;
 		prt = erts_dequeue_port(rq);
 		if (prt) {
@@ -3275,6 +3277,10 @@ evacuate_run_queue(ErtsRunQueue *rq,
 	while (prt) {
 	    ErtsRunQueue *prt_rq;
 	    prt = erts_dequeue_port(rq);
+	    if(ERTS_PORT_SFLG_BOUND & prt->status) {
+	        // simply clear SFLG_BOUND flag after evacuate
+	        prt->status &= ~ERTS_PORT_SFLG_BOUND;
+	    }
 #ifdef ERTS_POLLSET_PER_SCHEDULER
 	    erts_transfer_outstanding_io_tasks(prt, rq, to_rq);
 #endif
@@ -3427,7 +3433,8 @@ no_procs:
     /*
      * Check for a runnable port to steal...
      */
-    if (vrq->ports.start) {
+    if (vrq->ports.start && 
+        !(ERTS_PORT_SFLG_BOUND & vrq->ports.start->status)) {
 	ErtsRunQueue *prt_rq;
 	Port *prt = erts_dequeue_port(vrq);
 #ifdef ERTS_POLLSET_PER_SCHEDULER

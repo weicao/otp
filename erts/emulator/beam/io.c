@@ -426,6 +426,24 @@ setup_port(Port* prt, Eterm pid, erts_driver_t *driver,
 {
     ErtsRunQueue *runq = erts_get_runq_current(NULL);
     char *new_name, *old_name;
+
+#ifdef ERTS_SMP
+    Process *rp = NULL;
+    ErtsProcLocks rp_locks = 0;
+
+    rp = erts_pid2proc(NULL, 0, pid, rp_locks);
+    if(rp) {
+        erts_aint32_t state = erts_smp_atomic32_read_nob(&rp->state);
+        if(state & ERTS_PSFLG_BOUND) {
+            ErtsRunQueue *rq = (ErtsRunQueue *) erts_smp_atomic_read_nob(&rp->run_queue);
+            if(rq) {
+                runq = rq;
+                xstatus |= ERTS_PORT_SFLG_BOUND;
+            }
+        }
+    }
+#endif
+
 #ifdef DEBUG
     /* Make sure the debug flags survives until port is freed */
     xstatus |= ERTS_PORT_SFLG_PORT_DEBUG;

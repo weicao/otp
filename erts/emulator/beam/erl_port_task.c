@@ -934,7 +934,11 @@ erts_port_task_execute(ErtsRunQueue *runq, Port **curr_port_pp)
 	ASSERT(pp->sched.taskq->first);
 
 #ifdef ERTS_SMP
+    if(ERTS_PORT_SFLG_BOUND & pp->status) {
+    xrunq = NULL;
+    } else {
 	xrunq = erts_check_emigration_need(runq, ERTS_PORT_PRIO_LEVEL);
+    }
 	if (!xrunq) {
 #endif
 	    enqueue_port(runq, pp);

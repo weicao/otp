@@ -731,6 +731,8 @@ do {									\
 #define ERTS_PORT_SFLG_INVALID		((Uint32) (1 << 14))
 /* Last port to terminate halts the emulator */
 #define ERTS_PORT_SFLG_HALT		((Uint32) (1 << 15))
+/* Bound port to scheduler */
+#define ERTS_PORT_SFLG_BOUND    ((Uint32) (1 << 16))
 #ifdef DEBUG
 /* Only debug: make sure all flags aren't cleared unintentionally */
 #define ERTS_PORT_SFLG_PORT_DEBUG	((Uint32) (1 << 31))
