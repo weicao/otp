@@ -5852,7 +5852,21 @@ sched_thread_func(void *vesdp)
     return NULL;
 }
 
+
+static void *
+deliver_time_thread(void *unused)
+{
+    while (1) {
+    erts_deliver_time();
+    erts_milli_sleep(1);
+    }
+    return NULL;
+}
+
+
 static ethr_tid aux_tid;
+
+static ethr_tid deliver_time_tid;
 
 void
 erts_start_schedulers(void)
@@ -5891,6 +5905,10 @@ erts_start_schedulers(void)
     res = ethr_thr_create(&aux_tid, aux_thread, NULL, &opts);
     if (res != 0)
 	erl_exit(1, "Failed to create aux thread\n");
+	
+	res = ethr_thr_create(&deliver_time_tid, deliver_time_thread, NULL, NULL);
+	if (res != 0)
+	erl_exit(1, "Failed to create deliver time thread\n");
 
     if (actual < 1)
 	erl_exit(1,
