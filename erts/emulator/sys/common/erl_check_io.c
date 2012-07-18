@@ -1942,6 +1942,7 @@ ERTS_CIO_EXPORT(erts_init_check_io)(void)
 #if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
     init_selected_fd_alloc();
     sfl_tab = NULL;
+    erts_smp_mtx_init(&sfl_tab_lock, "sfl_tab_lock");
 #endif
 }
 

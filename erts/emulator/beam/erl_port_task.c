@@ -538,13 +538,6 @@ erts_port_task_schedule(Eterm id,
      *          tasks_lock is held.
      */
 
-    if (pthp && erts_port_task_is_scheduled(pthp)) {
-	ASSERT(0);
-	erts_port_task_abort(id, pthp);
-    }
-
-    ptp = port_task_alloc();
-
     ASSERT(is_internal_port(id));
     pp = &erts_port[internal_port_index(id)];
     runq = erts_port_runq(pp);
@@ -563,7 +556,12 @@ erts_port_task_schedule(Eterm id,
     }
 #endif
 
-    ASSERT(!erts_port_task_is_scheduled(pthp));
+    if (pthp && erts_port_task_is_scheduled(pthp)) {
+	ASSERT(0);
+	erts_port_task_abort(id, pthp);
+    }
+
+    ptp = port_task_alloc();
 
     ERTS_PT_CHK_PRES_PORTQ(runq, pp);
 
