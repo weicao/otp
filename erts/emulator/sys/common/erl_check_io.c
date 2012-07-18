@@ -1612,7 +1612,9 @@ ERTS_CIO_EXPORT(erts_check_io)(int ix, int do_wait)
     erts_lc_check_exact(NULL, 0); /* No locks should be locked */
 #endif
 
-    //erts_deliver_time(); /* sync the machine's idea of time */
+#ifndef ERTS_SMP
+    erts_deliver_time(); /* sync the machine's idea of time */
+#endif
 
 #ifdef ERTS_BREAK_REQUESTED
     if (ERTS_BREAK_REQUESTED)
