@@ -1894,12 +1894,12 @@ ERTS_CIO_EXPORT(erts_init_check_io)(void)
     
     erts_pollsets = erts_alloc(ERTS_ALC_T_UNDEF,
 				n * sizeof(struct pollset_info));
+    erts_no_pollsets = n;
     for (ix = 0; ix < n; ix ++) {
         struct pollset_info *pollset = ERTS_POLLSET_IX(ix);
         erts_smp_atomic_init_nob(&pollset->in_poll_wait, 0);
         pollset->ps = ERTS_CIO_NEW_POLLSET();
     }
-    erts_no_pollsets = n;
 
 #ifdef ERTS_SMP
     init_removed_fd_alloc();
