@@ -227,6 +227,7 @@ int erts_transfer_outstanding_io_tasks(Port* pp, ErtsRunQueue* from, ErtsRunQueu
         }
         }
     }
+    return 0;
 }
 #endif
 

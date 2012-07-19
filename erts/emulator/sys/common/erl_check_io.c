@@ -810,8 +810,8 @@ ERTS_CIO_EXPORT(driver_select)(ErlDrvPort ix,
     ErtsDrvEventState *state;
     int wake_poller;
     int ret;
-    ErtsPollSet inps;
-    ErtsPollSet outps;
+    ErtsPollSet inps = NULL;
+    ErtsPollSet outps = NULL;
     
 #ifdef USE_VM_PROBES
     DTRACE_CHARBUF(name, 64);
