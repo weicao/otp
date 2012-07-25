@@ -421,16 +421,15 @@ ERTS_CIO_EXPORT(erts_check_io_change_port_pollset)(Eterm id, int to_rq_ix)
         case ERTS_EV_TYPE_DRV_SEL: {
         Eterm iid = state->driver.select->inport;
         Eterm oid = state->driver.select->outport;
-        state->events = 0;
         
         if( id == iid ) {
             ErtsPollSet from_ps = state->driver.select->inps;
             if( from_ps != to_ps ) {
             state->driver.select->inps = to_ps;
-            do_wake = 1;
+            do_wake = 0;
             ERTS_CIO_POLL_CTL(from_ps, state->fd, ERTS_POLL_EV_IN, 0, &do_wake);
             do_wake = 1;
-            state->events |= ERTS_CIO_POLL_CTL(to_ps, state->fd, ERTS_POLL_EV_IN, 1, &do_wake);
+            state->events = ERTS_CIO_POLL_CTL(to_ps, state->fd, ERTS_POLL_EV_IN, 1, &do_wake);
             }
         }
         
@@ -438,10 +437,10 @@ ERTS_CIO_EXPORT(erts_check_io_change_port_pollset)(Eterm id, int to_rq_ix)
             ErtsPollSet from_ps = state->driver.select->outps;
             if( from_ps != to_ps ) {
             state->driver.select->outps = to_ps;
-            do_wake = 1;
+            do_wake = 0;
             ERTS_CIO_POLL_CTL(from_ps, state->fd, ERTS_POLL_EV_OUT, 0, &do_wake);
             do_wake = 1;
-            state->events |= ERTS_CIO_POLL_CTL(to_ps, state->fd, ERTS_POLL_EV_OUT, 1, &do_wake);
+            state->events = ERTS_CIO_POLL_CTL(to_ps, state->fd, ERTS_POLL_EV_OUT, 1, &do_wake);
             }
         }
         break;
@@ -452,7 +451,7 @@ ERTS_CIO_EXPORT(erts_check_io_change_port_pollset)(Eterm id, int to_rq_ix)
         state->driver.event->ps = to_ps;
         do_wake = 0;
         ERTS_CIO_POLL_CTL(from_ps, state->fd, state->events, 0, &do_wake);
-        do_wake = 0;
+        do_wake = 1;
         state->events = ERTS_CIO_POLL_CTL(to_ps, state->fd, state->events, 1, &do_wake);
         }
         break;
@@ -695,23 +694,22 @@ deselect(ErtsDrvEventState *state, int mode)
     case ERTS_EV_TYPE_DRV_SEL: {
         Eterm iid = state->driver.select->inport;
         Eterm oid = state->driver.select->outport;
-        state->events = 0;
         if (!mode) {
             mode = ERL_DRV_READ | ERL_DRV_WRITE;
         }
         if (mode & ERL_DRV_READ && is_not_nil(iid)) {
-            state->events |= ERTS_CIO_POLL_CTL(state->driver.select->inps,
+            state->events = ERTS_CIO_POLL_CTL(state->driver.select->inps,
                     state->fd, ERTS_POLL_EV_IN, 0, &do_wake);
             state->driver.select->inport = NIL;
             state->driver.select->inps = NULL;
-            do_wake = 0;
             
             if( is_nil(oid) || iid != oid || !(mode & ERL_DRV_WRITE) ) {
                 del_selected_fd(internal_port_index(iid), state);
             }
         }
         if (mode & ERL_DRV_WRITE && is_not_nil(oid)) {
-            state->events |= ERTS_CIO_POLL_CTL(state->driver.select->outps,
+            do_wake = 0;
+            state->events = ERTS_CIO_POLL_CTL(state->driver.select->outps,
                     state->fd, ERTS_POLL_EV_OUT, 0, &do_wake);
             state->driver.select->outport = NIL;
             state->driver.select->outps = NULL;
@@ -911,7 +909,7 @@ ERTS_CIO_EXPORT(driver_select)(ErlDrvPort ix,
     }
 
 #if defined(ERTS_SMP) && defined(ERTS_POLLSET_PER_SCHEDULER)
-    new_events = 0;
+    new_events = state->events;
     {
     int wake_poller_cmd;
     int wake_poller_res = 0;
@@ -923,7 +921,7 @@ ERTS_CIO_EXPORT(driver_select)(ErlDrvPort ix,
             inps = ERTS_POLLSET_IX(((ErtsRunQueue *) erts_smp_atomic_read_nob(
                     &erts_drvport2port(ix)->run_queue))->ix)->ps;
         }
-        new_events |= ERTS_CIO_POLL_CTL(inps, state->fd, ERTS_POLL_EV_IN, on, &wake_poller_cmd);
+        new_events = ERTS_CIO_POLL_CTL(inps, state->fd, ERTS_POLL_EV_IN, on, &wake_poller_cmd);
         wake_poller_res |= wake_poller_cmd;
     }
     if (ctl_events & ERTS_POLL_EV_OUT) {
@@ -934,7 +932,7 @@ ERTS_CIO_EXPORT(driver_select)(ErlDrvPort ix,
             outps = ERTS_POLLSET_IX(((ErtsRunQueue *) erts_smp_atomic_read_nob(
                     &erts_drvport2port(ix)->run_queue))->ix)->ps;
         }
-        new_events |= ERTS_CIO_POLL_CTL(outps, state->fd, ERTS_POLL_EV_OUT, on, &wake_poller_cmd);
+        new_events = ERTS_CIO_POLL_CTL(outps, state->fd, ERTS_POLL_EV_OUT, on, &wake_poller_cmd);
         wake_poller_res |= wake_poller_cmd;
     }
     wake_poller = wake_poller_res;
